@@ -23,6 +23,7 @@ from .config import Config
 
 plugin_config = get_plugin_config(Config)
 plugin_config.owner_id = str(plugin_config.owner_id)
+plugin_config.bot_name = str(plugin_config.bot_name)
 
 logger.info(f"插件加载 | bot={plugin_config.bot_name} owner={plugin_config.owner_id}")
 logger.info(f"允许群: {plugin_config.allowed_groups or '(无)'}")

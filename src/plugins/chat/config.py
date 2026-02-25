@@ -3,7 +3,7 @@ from pydantic import BaseModel
 
 class Config(BaseModel):
     owner_id: str | int = ""
-    bot_name: str = "48"
+    bot_name: str | int = "48"
 
     # 允许发言的群（空列表 = 不在任何群发言，必须显式配置）
     allowed_groups: list[str] = []
