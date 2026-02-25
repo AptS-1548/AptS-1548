@@ -79,3 +79,32 @@ async def chat(
             return block.text
 
     return response.content[-1].text
+
+
+async def chat_structured(
+    system: str,
+    messages: list[dict],
+    tool: dict,
+    max_tokens: int = 512,
+) -> dict:
+    """Fix 6: tool_use 强制结构化输出，LLM 直接填 schema，无需 JSON 解析。
+    返回 tool input dict，调用方直接用 data["field"]。
+    """
+    env = get_driver().config
+    model = getattr(env, "claude_model", "claude-opus-4-6")
+    client = _get_client()
+
+    response = await client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+        messages=messages,
+        tools=[tool],
+        tool_choice={"type": "tool", "name": tool["name"]},
+    )
+
+    for block in response.content:
+        if block.type == "tool_use":
+            return block.input
+
+    raise ValueError("tool_use 响应缺失")
