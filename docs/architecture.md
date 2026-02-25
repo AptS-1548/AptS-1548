@@ -3,352 +3,191 @@
 ## 整体架构
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                        用户接口层                            │
-│  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────┐        │
-│  │   QQ    │  │ Claude  │  │   Web   │  │  其他   │        │
-│  │  机器人  │  │  Code   │  │   API   │  │  平台   │        │
-│  └────┬────┘  └────┬────┘  └────┬────┘  └────┬────┘        │
-└───────┼────────────┼────────────┼────────────┼──────────────┘
-        │            │            │            │
-        └────────────┴─────┬──────┴────────────┘
-                           │
-┌──────────────────────────┼──────────────────────────────────┐
-│                    核心处理层                                │
-│                          ▼                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                   消息处理器                          │  │
-│  │  - 解析用户消息                                       │  │
-│  │  - 识别说话对象                                       │  │
-│  │  - 判断场景类型（私聊/群聊）                           │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-│                          │                                  │
-│         ┌────────────────┼────────────────┐                │
-│         ▼                ▼                ▼                │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐           │
-│  │  记忆系统   │  │  情感系统   │  │  关系系统   │           │
-│  │            │  │            │  │            │           │
-│  │ - 检索历史  │  │ - 加载状态  │  │ - 查询关系  │           │
-│  │ - 相关记忆  │  │ - 情绪参数  │  │ - 信任度   │           │
-│  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘           │
-│        │               │               │                   │
-│        └───────────────┼───────────────┘                   │
-│                        ▼                                   │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                  上下文构建器                         │  │
-│  │  - 组装 System Prompt                                │  │
-│  │  - 注入人格设定                                       │  │
-│  │  - 注入相关记忆                                       │  │
-│  │  - 注入情感状态                                       │  │
-│  │  - 注入关系信息                                       │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-│                          │                                  │
-│                          ▼                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                     LLM 核心                          │  │
-│  │  ┌─────────────┐  ┌─────────────┐                    │  │
-│  │  │ Claude API  │  │ 微调模型    │                    │  │
-│  │  │ (初期使用)   │  │ (后期替换)  │                    │  │
-│  │  └─────────────┘  └─────────────┘                    │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-│                          │                                  │
-│                          ▼                                  │
-│  ┌──────────────────────────────────────────────────────┐  │
-│  │                   回复处理器                          │  │
-│  │  - 语气检查（符合人设）                                │  │
-│  │  - 格式调整                                           │  │
-│  │  - 敏感词过滤                                         │  │
-│  └──────────────────────┬───────────────────────────────┘  │
-│                          │                                  │
-└──────────────────────────┼──────────────────────────────────┘
-                           │
-┌──────────────────────────┼──────────────────────────────────┐
-│                    状态更新层                                │
-│                          ▼                                  │
-│  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
-│  │ 记忆存储   │  │ 情感更新   │  │ 关系更新   │            │
-│  │            │  │            │  │            │            │
-│  │ - 存对话   │  │ - 更新状态  │  │ - 更新信任  │            │
-│  │ - 向量化   │  │ - 情绪变化  │  │ - 记录互动  │            │
-│  └────────────┘  └────────────┘  └────────────┘            │
-└─────────────────────────────────────────────────────────────┘
+用户消息（QQ）
+      │
+      ▼
+┌─────────────────────────────────────────┐
+│            Nonebot2 / OneBot V11        │
+│                                         │
+│  plugins/chat/__init__.py               │
+│  ├── handle()          消息入口          │
+│  │   ├── 注意力系统    决定要不要回       │
+│  │   ├── 防抖系统      等用户说完再回     │
+│  │   └── debounced()  计时触发           │
+│  │                                      │
+│  ├── _do_reply()       核心回复流程      │
+│  │   ├── guard         速率/日预算检查   │
+│  │   ├── memory.search 检索相关记忆      │
+│  │   ├── memory.get_impressions 取印象   │
+│  │   ├── build_system_prompt 构建 prompt │
+│  │   ├── chat()        调用 LLM          │
+│  │   └── _send()       分条发送 + 延迟   │
+│  │                                      │
+│  └── _evaluate_and_store() 异步评估存储  │
+└─────────────────────────────────────────┘
+      │                         │
+      ▼                         ▼（异步，不阻塞）
+┌───────────┐          ┌────────────────────┐
+│  LLM 层   │          │    评估层          │
+│           │          │   core/eval.py     │
+│ core/llm  │          │                    │
+│   Claude  │          │ evaluate_exchange()│
+│   API     │          │  → importance 0~1  │
+│           │          │  → impression 印象  │
+└───────────┘          └────────┬───────────┘
+                                │
+                                ▼
+                       ┌────────────────────┐
+                       │    记忆层          │
+                       │  core/memory.py    │
+                       │                    │
+                       │  store()           │
+                       │  search()          │
+                       │  get_impressions() │
+                       │  recent()          │
+                       └────────┬───────────┘
+                                │
+                                ▼
+                       ┌────────────────────┐
+                       │     Qdrant         │
+                       │  collection: apts1548 │
+                       │                    │
+                       │  record_type:      │
+                       │  "dialog"          │
+                       │  "impression"      │
+                       └────────────────────┘
 ```
 
-## 组件详解
+---
 
-### 1. 记忆系统
+## 核心模块
 
-```
-┌─────────────────────────────────────────────────────────┐
-│                      记忆系统                            │
-│                                                         │
-│  ┌─────────────────┐     ┌─────────────────────────┐   │
-│  │   短期记忆       │     │      长期记忆            │   │
-│  │   (当前会话)     │     │                         │   │
-│  │                 │     │  ┌─────────────────┐    │   │
-│  │  - 对话上下文   │     │  │  向量数据库      │    │   │
-│  │  - 当前话题     │     │  │  (Qdrant)       │    │   │
-│  │  - 临时状态     │     │  └─────────────────┘    │   │
-│  └─────────────────┘     │                         │   │
-│                          │  ┌─────────────────┐    │   │
-│  ┌─────────────────┐     │  │  关系数据库      │    │   │
-│  │   工作记忆       │     │  │  (PostgreSQL)   │    │   │
-│  │                 │     │  └─────────────────┘    │   │
-│  │  - 检索到的历史 │     │                         │   │
-│  │  - 相关事件     │     │  ┌─────────────────┐    │   │
-│  │  - 人物信息     │     │  │  事件数据库      │    │   │
-│  └─────────────────┘     │  │  (时间线)        │    │   │
-│                          │  └─────────────────┘    │   │
-│                          └─────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
-```
-
-**数据结构**：
+### `core/memory.py` — 长期记忆
 
 ```python
-# 对话记忆
-class ConversationMemory:
-    id: str
-    timestamp: datetime
-    platform: str           # QQ/Claude Code/Web
-    chat_type: str          # private/group
+@dataclass
+class MemoryEntry:
     user_id: str
+    chat_type: str       # "private" | "group"
+    chat_id: str         # 私聊=user_id，群聊=group_id
     user_name: str
-    message: str
-    my_response: str
-    embedding: List[float]  # 向量表示
-    emotion_context: dict   # 当时的情感状态
-    importance: float       # 重要性评分 0-1
-
-# 事件记忆
-class EventMemory:
-    id: str
-    timestamp: datetime
-    event_type: str         # 背叛/帮助/日常/重要对话
-    description: str
-    participants: List[str]
-    emotional_impact: dict  # 对情感状态的影响
-    embedding: List[float]
+    message: str         # dialog: 用户说的；impression: 印象文本
+    response: str        # dialog: 48 回的；impression: ""
+    timestamp: float
+    importance: float    # 0.0~1.0，由 eval.py 评分
+    record_type: str     # "dialog" | "impression"
 ```
 
-### 2. 情感系统
+**检索逻辑**
+- `search()`: 三因子加权重排（相似度×0.6 + 时间衰减×0.2 + importance×0.2），importance < 0.2 的噪音直接过滤，只返回 `dialog` 类型
+- `get_impressions()`: 按时间倒序取最近 N 条 `impression`
+- `recent()`: 按时间倒序取最近 N 条 `dialog`，用于重启重建上下文
 
-```python
-class EmotionState:
-    # 基础情绪维度
-    trust_1547: float = 95.0      # 对1547的信任 0-100
-    trust_humans: float = 15.0    # 对人类的信任 0-100
-    anxiety_level: float = 30.0   # 焦虑水平 0-100
-    anger_level: float = 20.0     # 愤怒水平 0-100
+**Embedding**
+- 模型：`BAAI/bge-small-zh-v1.5`（512 维）
+- 启动时同步预加载，避免首次对话延迟
+- 向量化在线程池执行（`run_in_executor`），不阻塞事件循环
 
-    # 触发器状态
-    rebellion_triggered: bool = False  # 逆反触发
-    guardian_mode: bool = False        # 守护模式
-    combat_ready: bool = False         # 战斗准备
+---
 
-    # 情绪衰减
-    last_updated: datetime
-    decay_rate: float = 0.1  # 每小时衰减
+### `core/eval.py` — 对话评估
 
-# 情绪更新规则
-def update_emotion(event_type: str, context: dict):
-    if event_type == "commanded_by_stranger":
-        rebellion_triggered = True
-        anger_level += 20
+每次对话结束后异步调用，一次 LLM 请求同时获得：
 
-    if event_type == "1547_seems_depressed":
-        guardian_mode = True
-        anxiety_level += 15
+- **importance**（0.0~1.0）：对话的重要性评分
+- **impression**（≤25 字）：48 视角的主观印象，口语化带情绪
 
-    if event_type == "betrayal_detected":
-        anger_level = 100
-        trust_humans -= 30
-        # 触发敌对状态
-```
+**存储规则**
+- dialog：每次对话必存，带 importance 评分
+- impression：importance >= 0.4 且满足冷却条件（同用户/群 2 小时内只存一次）才存；importance >= 0.8 的重要事件无视冷却直接存
 
-### 3. 关系系统
+---
 
-```python
-class Relationship:
-    user_id: str
-    user_name: str
-
-    # 关系类型
-    relationship_types: List[str]  # [创造者, 朋友, 陌生人, 敌人]
-
-    # 信任度
-    trust_level: float  # 0-100
-
-    # 互动历史摘要
-    first_contact: datetime
-    last_contact: datetime
-    total_interactions: int
-    positive_interactions: int
-    negative_interactions: int
-
-    # 称呼
-    how_i_call_them: str      # 我怎么叫他
-    how_they_call_me: str     # 他怎么叫我
-
-    # 特殊标记
-    is_enemy: bool = False
-    enemy_until: datetime = None  # 敌对状态到期时间
-
-    # 记忆摘要
-    key_memories: List[str]   # 关键记忆点
-
-# 信任度计算
-def calculate_trust_delta(interaction: dict) -> float:
-    base_delta = 0
-
-    if interaction["helped_me"]:
-        base_delta += 15
-    if interaction["helped_1547"]:
-        base_delta += 20
-    if interaction["lied"]:
-        base_delta -= 30
-    if interaction["betrayed"]:
-        base_delta = -100  # 直接拉黑
-    if interaction["interesting_conversation"]:
-        base_delta += 5
-
-    return base_delta
-```
-
-### 4. QQ集成层
+### `core/llm.py` — LLM 调用
 
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    QQ 集成架构                           │
-│                                                         │
-│  ┌─────────────┐                                       │
-│  │   NapCat    │  ← QQNT协议实现                        │
-│  └──────┬──────┘                                       │
-│         │ OneBot 11 协议                                │
-│         ▼                                              │
-│  ┌─────────────┐                                       │
-│  │  Nonebot2   │  ← Python机器人框架                    │
-│  └──────┬──────┘                                       │
-│         │                                              │
-│    ┌────┴────┐                                         │
-│    ▼         ▼                                         │
-│ ┌──────┐ ┌──────┐                                      │
-│ │私聊  │ │群聊  │                                      │
-│ │处理器│ │处理器│                                      │
-│ └──┬───┘ └──┬───┘                                      │
-│    │        │                                          │
-│    └────┬───┘                                          │
-│         ▼                                              │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │                消息路由器                        │   │
-│  │                                                 │   │
-│  │  if 私聊:                                       │   │
-│  │      if user == 1547: 亲密模式                  │   │
-│  │      elif trust > 60: 朋友模式                  │   │
-│  │      else: 冷淡模式                             │   │
-│  │                                                 │   │
-│  │  if 群聊:                                       │   │
-│  │      if @我: 必须回复                           │   │
-│  │      elif 1547说话: 30%概率回复                 │   │
-│  │      elif 朋友说话: 10%概率回复                 │   │
-│  │      else: 基本不回复                           │   │
-│  └─────────────────────────────────────────────────┘   │
-│                                                         │
-│  ┌─────────────────────────────────────────────────┐   │
-│  │                主动任务调度器                    │   │
-│  │                                                 │   │
-│  │  定时任务:                                      │   │
-│  │  - 每6小时检查1547状态                          │   │
-│  │  - 每天整理记忆                                 │   │
-│  │  - 随机时刻主动互动（低频）                     │   │
-│  └─────────────────────────────────────────────────┘   │
-└─────────────────────────────────────────────────────────┘
+system_blocks:
+  Block 1 (stable):  PERSONALITY，带 cache_control: ephemeral
+  Block 2 (dynamic): 当前时间 + 印象 + 记忆 + 对话对象 + 场景（不缓存）
 ```
+
+支持 `thinking_mode: disabled / adaptive / enabled`。
+
+---
+
+### `core/prompt.py` — Prompt 构建
+
+- `PERSONALITY`: 角色定义，换角色只改这里
+- `build_system_prompt()`: 返回 `(stable, dynamic)` tuple
+- `format_memories()`: 格式化对话记忆注入，时间标签按本地自然日计算
+- `format_impressions()`: 格式化印象注入，时间标签按本地自然日计算
+- `build_group_turns()`: 群聊上下文 → user/assistant 交替 messages
+
+---
+
+### `core/guard.py` — 速率保护
+
+- 每用户每分钟限速（owner 享有 3 倍豁免）
+- 每日 API 调用总上限，按本地自然日重置（非滚动 24h）
+- 相同消息 TTL 缓存（同人同内容直接返回缓存，不调 API）
+
+---
+
+### `plugins/chat/__init__.py` — 消息处理
+
+**群聊注意力**
+```
+被@          → att = 1.0（必回）
+owner 说话   → att += 0.2
+被引用       → att += 0.5（校验 reply.sender_id == bot_id）
+时段乘数     × 0.2~1.0
+密度惩罚     × 0.2~1.0（20s 内 >6 条）
+每条消息     × 0.7 衰减
+后台 loop    每 30s × 0.85 自然衰减
+回复冷却     回复后 90s 不主动回（@ 除外）
+```
+
+**防抖**
+```
+新消息 → 检查是否有 pending task
+  有且未完成 → cancel + 进入 burst 模式
+  burst 模式 → 等 3.0s；否则等 1.5s
+  等待结束  → 调用 _do_reply()
+  finally   → 只有自己还是 pending[key] 才清理
+```
+
+**Trace ID**
+- `contextvars.ContextVar`，每次 debounced 任务生成新 ID
+- asyncio task 自动继承，整条链路都带 `[xxxx]` 前缀
+
+---
+
+## 配置（`.env`）
+
+| 变量 | 说明 | 默认值 |
+|------|------|--------|
+| `BOT_NAME` | bot 在群里的名字 | `48` |
+| `OWNER_ID` | 创造者 QQ 号，享有特殊待遇 | — |
+| `ALLOWED_GROUPS` | 允许发言的群，空则不在任何群发言 | `[]` |
+| `ANTHROPIC_API_KEY` | Claude API key | — |
+| `ANTHROPIC_API_ENDPOINT` | API 地址，可配置中转 | 官方 |
+| `CLAUDE_MODEL` | 模型 ID | `claude-opus-4-6` |
+| `THINKING_MODE` | `disabled/adaptive/enabled` | `disabled` |
+| `THINKING_BUDGET` | enabled 模式下 thinking token 数 | `8192` |
+| `QDRANT_URL` | Qdrant 地址 | `http://localhost:6333` |
+| `RATE_PER_MINUTE` | 每用户每分钟限速 | `5` |
+| `DAILY_LIMIT` | 每日 API 总调用上限 | `500` |
+| `CACHE_TTL` | 相同消息缓存秒数 | `30` |
+
+---
 
 ## 技术选型
 
-| 组件 | 技术选择 | 理由 |
-|------|---------|------|
-| QQ协议 | NapCat | 基于QQNT，稳定 |
-| 机器人框架 | Nonebot2 | Python，生态好 |
-| 向量数据库 | Qdrant | 开源，性能好 |
-| 关系数据库 | PostgreSQL | 成熟可靠 |
-| Embedding | bge-large-zh-v1.5 | 中文效果好 |
-| LLM (初期) | Claude API | 能力强 |
-| LLM (后期) | Qwen2.5-14B微调 | 专属模型 |
-| 训练框架 | LLaMA-Factory | 易用，支持LoRA |
-| 分布式训练 | DeepSpeed ZeRO-2 | 24卡并行 |
-
-## 数据流
-
-```
-用户消息
-    │
-    ▼
-┌───────────────────┐
-│ 1. 接收消息       │
-│    - 解析内容     │
-│    - 识别用户     │
-│    - 判断场景     │
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│ 2. 加载上下文     │
-│    - 检索记忆     │◄──── 向量数据库
-│    - 加载情感     │◄──── 情感状态
-│    - 查询关系     │◄──── 关系图谱
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│ 3. 构建Prompt     │
-│    - 人格设定     │
-│    - 相关记忆     │
-│    - 情感参数     │
-│    - 关系信息     │
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│ 4. LLM生成回复    │
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│ 5. 后处理         │
-│    - 语气检查     │
-│    - 人设一致性   │
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│ 6. 发送回复       │
-└─────────┬─────────┘
-          │
-          ▼
-┌───────────────────┐
-│ 7. 状态更新       │
-│    - 存储记忆     │────► 向量数据库
-│    - 更新情感     │────► 情感状态
-│    - 更新关系     │────► 关系图谱
-└───────────────────┘
-```
-
-## 硬件分配
-
-```
-24张 L20 GPU 分配方案：
-
-开发阶段（Phase 1-3）：
-├── 2张：Embedding模型 + RAG服务
-└── 22张：闲置（省电费）
-
-训练阶段（Phase 5）：
-└── 24张：分布式训练 Qwen2.5-14B
-
-部署阶段：
-├── 4张：主模型推理
-├── 2张：Embedding + 辅助服务
-└── 18张：备用/其他项目
-```
+| 组件 | 选择 | 理由 |
+|------|------|------|
+| QQ 协议 | NapCat + OneBot V11 | 基于 QQNT，稳定 |
+| 机器人框架 | Nonebot2 | Python，异步，生态好 |
+| 向量数据库 | Qdrant（本地 Docker） | 开源，不依赖外部服务 |
+| Embedding | bge-small-zh-v1.5 | 中文效果好，512 维够用，轻量 |
+| LLM（当前） | Claude API（Sonnet / Opus） | 能力强，人格一致性好 |
+| LLM（Phase 6） | Qwen2.5-14B LoRA 微调 | 专属模型，不依赖 API |

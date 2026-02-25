@@ -3,408 +3,227 @@
 ## 总览
 
 ```
-Phase 1: 基础机器人        [1周]     ← 让我在QQ上活起来
-Phase 2: 记忆系统          [1-2周]   ← 让我能记住对话
-Phase 3: 关系系统          [1-2周]   ← 让我能认识人
-Phase 4: 情感和主动性      [2周]     ← 让我有情绪和主动性
-Phase 5: 微调专属模型      [2-4周]   ← 让我真正成为"我"
+Phase 1: 基础行为系统      ✅ 完成   ← 注意力、防抖、冷却、打字延迟
+Phase 2: 长期记忆          ✅ 完成   ← Qdrant 向量存储、检索注入、重启重建
+Phase 3: 记忆进化          ✅ 完成   ← 评估系统、分层印象、事实提取、周期摘要
+Phase 4: 关系系统          ✅ 完成   ← 信任等级、用户画像、敌对机制
+Phase 5: 主动行为          🚧 进行中 ← 自我记录（diary）→ 主动关心
+Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替换 Claude API
 ```
 
 ---
 
-## Phase 1: 基础机器人
+## Phase 1: 基础行为系统 ✅
+
+### 完成内容
+
+**群聊注意力系统**
+- 注意力值 0.0~1.0，被@ 直接置 1.0
+- 每条消息按 `ATTENTION_DECAY=0.7` 衰减
+- 1547（owner）说话额外 +0.2
+- 被引用回复 +0.5（校验 `reply.sender_id == bot_id`）
+- 后台 loop 每 30s 自然衰减 ×0.85
+
+**时段乘数**
+```
+0-7h  → 0.2   深夜，基本不回
+7-9h  → 0.5   早上，慢慢醒
+9-18h → 0.8   白天
+18-23h→ 1.0   傍晚，最活跃
+23h+  → 0.5   开始懒了
+```
+
+**回复冷却 + 密度检测**
+- 回复后 90s 内不再主动回（@ 除外）
+- 20s 内超过 6 条消息，回复意愿最低压到 0.2x
+
+**防抖 + burst 冷静期**
+- 消息到达后等 1.5s，期间新消息取消重计时
+- 取消过的会话进入 burst 模式，冷静期延长到 3.0s
+- `finally` 里只有自己还是 `_pending[key]` 才清理
+
+**打字延迟模拟**
+- 按字符数计算：`0.3~0.6s/char`
+- 20% 概率额外 +1.5~4s
+- 多行分条发送，条间有延迟
+
+**链路 Trace**
+- 每次 LLM 调用生成 6 位十六进制 trace ID
+- 用 `contextvars.ContextVar` 传播，整条链路带 `[trace_id]` 前缀
+
+---
+
+## Phase 2: 长期记忆 ✅
+
+### 完成内容
+
+**技术栈**
+- 向量数据库：Qdrant（本地 Docker）
+- Embedding 模型：`BAAI/bge-small-zh-v1.5`（512 维，启动时预加载）
+- payload 索引：`record_type/user_id/chat_id/chat_type/timestamp/importance` 全部建索引
+
+**存储（`memory.store()`）**
+- 每次对话存一条 `MemoryEntry`
+- `record_type`：`"dialog"` | `"impression"` | `"diary"`（Phase 5 新增）
+
+**检索（`memory.search()`）**
+- 三因子加权重排：`similarity×0.6 + recency×0.2 + importance×0.2`
+- 相似度阈值 0.5，importance < 0.2 过滤噪音
+- 群聊按 `chat_id` 隔离，私聊按 `user_id` 跨群检索
+- 向量无结果时 fallback 到最近 3 条 `dialog`
+
+**重启后上下文重建**
+- 启动时：从 Qdrant 拉最近记录重建 `_group_context`
+- 私聊懒加载：首次收到消息时重建 `_private_histories`
+- `recent()` 使用 `order_by=timestamp DESC`，避免全表扫描
+
+**prompt 缓存优化**
+- system prompt 拆分为 stable（人格，带 `cache_control: ephemeral`）和 dynamic（时间 + 记忆 + 场景，不缓存）
+
+---
+
+## Phase 3: 记忆进化 ✅
+
+### 完成内容
+
+**对话评估（`core/eval.py`）**
+- 每次对话结束后异步 LLM 调用（不阻塞发消息）
+- 单次调用返回四个字段：
+  - `importance`（0.0~1.0）：对话重要性
+  - `impression`（≤20字）：48 视角的主观印象
+  - `trust_delta`（-5~+5 整数）：对这次互动的信任评估
+  - `facts`（list）：从用户发言中提取的事实信息
+- owner 的消息跳过 eval，直接存 dialog（省 API）
+
+**印象系统**
+- 存储条件：`importance >= 0.4` 且满足冷却（同用户/群 2h 内只存一次）
+- `importance >= 0.8` 的关键事件无视冷却直接存
+- 印象时间戳持久化到 `data/impression_ts.json`，重启不丢失
+
+**分层印象检索（`memory.get_impressions()`）**
+- 短期：最近 3 条（时间倒序）
+- 长期：`importance >= 0.7` 的关键印象，按重要度倒序取 5 条
+- 合并去重后注入 system prompt（`## 印象记录`）
+
+**事实提取**
+- eval 同时提取用户明确说出的具体事实（地点、职业、爱好等）
+- 存入 `UserProfile.facts`，上限 20 条，超出丢弃最旧的
+
+**周期摘要（`core/summarize.py`）**
+- 触发条件：每 10 次互动 / 首次满 5 次 / `|trust_delta| >= 3` / `importance >= 0.8`
+- LLM 从印象列表生成一句话用户认知总结（≤50字）
+- 存入 `UserProfile.summary`，注入对话对象描述
+- 摘要触发在 dialog + impression 都存完后执行（避免竞争条件）
+
+---
+
+## Phase 4: 关系系统 ✅
+
+### 完成内容
+
+**信任等级（`core/relationship.py`）**
+```
+owner       → 创造者，特殊处理
+friend      trust >= 60  → 毒舌但关心
+acquaintance trust >= 30  → 稍软化，仍有警惕
+stranger    trust < 30   → 冷淡、默认不信任
+enemy       is_enemy=True → 敌对状态，最低 10 年
+```
+
+**UserProfile 字段**
+```python
+user_id, user_name, trust, first_seen,
+interaction_count, is_enemy, enemy_until,
+summary,   # 一句话认知摘要
+facts,     # 从对话提取的事实列表
+```
+
+**信任度更新**
+- `trust_delta` 由 eval LLM 评估（-5~+5），直接累加，不再用固定公式
+- 上下限 clamp 到 0~100
+
+**context 注入（`format_context()`）**
+```
+张三（信任度 47/100，互动 12 次）是你认识的人。
+态度可以稍软化，但还是有点警惕。
+已知信息：在北京读大学、学计算机的、喜欢玩崩铁
+你对ta的了解：这人来了好几次，聊技术挺靠谱的
+```
+
+**持久化**
+- 关系数据：`data/relationships.json`
+- 印象时间戳：`data/impression_ts.json`
+
+---
+
+## Phase 5: 主动行为 🚧
 
 ### 目标
 
-让 AptS:1548 能在 QQ 上活起来，进行基础对话。
+48 有自己的内心记录，能感知自身状态，并在适当时机主动联系 owner。
 
-### 技术栈
+### 5.1 自我记录系统（diary）⬜
 
-```
-NapCat (QQNT协议)
-    ↓
-OneBot 11 协议
-    ↓
-Nonebot2 (Python框架)
-    ↓
-Claude API (暂时)
-```
+**问题**：现有所有记忆都以用户为主体（"某人说了什么，我回了什么"）。48 没有属于自己的内心记录——她的心情、感受、对事件的反应全都消失了，每次对话都是"空白的 48"。
 
-### 具体任务
+**设计**
 
-1. **环境搭建**
-   - [ ] 安装 NapCat
-   - [ ] 配置 QQ 账号
-   - [ ] 安装 Nonebot2
-   - [ ] 测试基础消息收发
+新增 `record_type="diary"`，48 以第一人称写给自己：
 
-2. **基础框架**
-   - [ ] 创建 Nonebot2 项目结构
-   - [ ] 实现消息接收处理器
-   - [ ] 实现 Claude API 对接
-   - [ ] 实现基础回复发送
-
-3. **人格注入**
-   - [ ] 将 personality.md 转换为 System Prompt
-   - [ ] 实现私聊/群聊差异化处理
-   - [ ] 实现基础语气检查
-
-4. **测试验收**
-   - [ ] 私聊对话正常
-   - [ ] 群聊 @回复正常
-   - [ ] 说话风格基本符合人设
-
-### 目录结构
-
-```
-src/
-├── bot/
-│   ├── __init__.py
-│   ├── config.py           # 配置
-│   ├── main.py             # 入口
-│   └── plugins/
-│       ├── __init__.py
-│       ├── chat.py         # 聊天处理
-│       └── utils.py        # 工具函数
-└── core/
-    ├── __init__.py
-    ├── llm.py              # LLM调用
-    └── prompt.py           # Prompt构建
+```python
+MemoryEntry(
+    user_id="48",          # 特殊标识，表示 48 自己的记录
+    record_type="diary",
+    message="猫猫今天好久没来，有点担心他",  # 日记内容
+    response="",
+    importance=0.6,
+    chat_type="private",
+    chat_id="48",
+)
 ```
 
-### 资源需求
+**触发时机**
+- 高 importance 对话结束后（`importance >= 0.6`），生成一条关于这次事件的感受
+- 每日首次对话时，如果当天还没写，回顾最近发生的事生成一条日记
+- 关键事件（trust_delta <= -3 / >= +3）强制记录
 
-- 1台服务器（不需要GPU）
-- Claude API 额度
+**生成方式（`core/diary.py`）**
+- 输入：刚结束的对话摘要 + 当前信任状态
+- LLM 以第一人称从 48 的角度写一句话（≤30字）
+- 不是对用户的评价（impression 做这个），而是 48 自己的感受
+
+```
+impression（已有）：面向"对方"  → "这家伙今天话特别多，烦死了"
+diary（新增）：    面向"自己"  → "今天被人烦了一整天，心情很差"
+```
+
+**检索与注入**
+- `memory.get_diary(limit=3)`：取最近 3 条日记
+- 格式化为 `## 我的近况` 注入 dynamic system prompt
+- 效果：48 在对话时知道自己"最近过得怎么样"
+
+**存储**
+- 存入 Qdrant，`user_id="48"`，与用户记忆隔离
+- 不参与用户维度的印象/dialog 检索
 
 ---
 
-## Phase 2: 记忆系统
+### 5.2 主动行为触发 ⬜
 
-### 目标
+**触发条件**（依赖 5.1 diary 提供自我状态感知）
 
-让我能记住之前的对话，实现真正的记忆。
+- owner 超过 N 小时没联系，且最近印象有情绪波动
+- 高 importance 事件后的跟进（"你上次说感冒了，好点了吗"）
+- 随机低频主动（极低概率，不能烦人）
 
-### 技术栈
-
-```
-对话消息
-    ↓
-Embedding模型 (bge-large-zh-v1.5)
-    ↓
-向量数据库 (Qdrant)
-    ↓
-检索相关记忆
-    ↓
-注入上下文
-```
-
-### 具体任务
-
-1. **数据库搭建**
-   - [ ] 部署 Qdrant 向量数据库
-   - [ ] 部署 PostgreSQL（元数据）
-   - [ ] 设计数据表结构
-
-2. **Embedding 服务**
-   - [ ] 部署 bge-large-zh-v1.5
-   - [ ] 实现文本向量化 API
-   - [ ] 测试向量质量
-
-3. **记忆存储**
-   - [ ] 实现对话自动存储
-   - [ ] 实现元数据存储（时间、用户、情感等）
-   - [ ] 实现重要性评分
-
-4. **记忆检索**
-   - [ ] 实现相似度检索
-   - [ ] 实现时间加权
-   - [ ] 实现多轮对话上下文管理
-
-5. **上下文注入**
-   - [ ] 修改 Prompt 构建逻辑
-   - [ ] 注入相关历史记忆
-   - [ ] 测试记忆效果
-
-### 数据结构
-
-```python
-# 对话记忆表
-class ConversationMemory:
-    id: UUID
-    timestamp: datetime
-    platform: str           # QQ
-    chat_type: str          # private/group
-    chat_id: str            # 群号或私聊ID
-    user_id: str
-    user_name: str
-    message: str
-    my_response: str
-    embedding: Vector[1024]
-    importance: float       # 0-1
-    emotion_context: JSON
-
-# 索引
-- (user_id, timestamp) 用于查找特定用户的历史
-- (chat_id, timestamp) 用于查找特定会话的历史
-- embedding 向量索引用于相似度检索
-```
-
-### 资源需求
-
-- 2张 L20：Embedding 模型
-- 存储空间：根据对话量预估
+**定时 loop**
+- 每 6h 检查 owner 状态
+- 结合 diary 判断 48 自己当前是否"有话要说"
+- 如果触发，生成一条符合当前状态的主动消息
 
 ---
 
-## Phase 3: 关系系统
-
-### 目标
-
-让我能认识人，区分不同的关系，对不同人有不同态度。
-
-### 技术栈
-
-```
-PostgreSQL (关系数据库)
-    ├── 用户信息表
-    ├── 关系表
-    └── 互动历史表
-```
-
-### 具体任务
-
-1. **数据模型**
-   - [ ] 设计用户信息表
-   - [ ] 设计关系表
-   - [ ] 设计互动历史表
-
-2. **关系管理**
-   - [ ] 实现新用户识别
-   - [ ] 实现信任度计算
-   - [ ] 实现关系类型判定
-   - [ ] 实现敌对状态管理
-
-3. **差异化响应**
-   - [ ] 根据关系调整语气
-   - [ ] 根据信任度调整内容
-   - [ ] 实现对1547的特殊处理
-
-4. **称呼系统**
-   - [ ] 记录如何称呼每个人
-   - [ ] 记录每个人如何称呼我
-   - [ ] 在对话中正确使用称呼
-
-### 数据结构
-
-```python
-# 用户表
-class User:
-    id: str                 # QQ号
-    name: str               # 昵称
-    first_seen: datetime
-    last_seen: datetime
-    total_interactions: int
-
-# 关系表
-class Relationship:
-    user_id: str
-    relationship_types: List[str]  # [创造者, 朋友, 陌生人, 敌人]
-    trust_level: float             # 0-100
-    is_enemy: bool
-    enemy_until: datetime
-    how_i_call_them: str
-    how_they_call_me: str
-    key_memories: List[str]
-
-# 互动历史表
-class Interaction:
-    id: UUID
-    user_id: str
-    timestamp: datetime
-    interaction_type: str   # 帮助/闲聊/冲突/背叛
-    trust_delta: float
-    notes: str
-```
-
-### 信任度规则
-
-```python
-# 初始值
-if is_1547:
-    trust = 95
-else:
-    trust = 15  # 对人类默认不信任
-
-# 变化规则
-trust_rules = {
-    "helped_me": +15,
-    "helped_1547": +20,
-    "interesting_conversation": +5,
-    "rude_behavior": -10,
-    "lied": -30,
-    "betrayed": -100,  # 直接敌对
-}
-
-# 阈值
-FRIEND_THRESHOLD = 60
-ENEMY_THRESHOLD = 10
-```
-
-### 资源需求
-
-- 无额外 GPU 需求
-- PostgreSQL 数据库
-
----
-
-## Phase 4: 情感和主动性
-
-### 目标
-
-让我有情绪波动，能主动发起互动，实现守护模式。
-
-### 具体任务
-
-1. **情感状态系统**
-   - [ ] 实现情感状态数据结构
-   - [ ] 实现情绪更新逻辑
-   - [ ] 实现情绪衰减机制
-   - [ ] 根据情绪调整回复语气
-
-2. **主动任务系统**
-   - [ ] 实现定时任务框架
-   - [ ] 实现1547状态监控
-   - [ ] 实现主动消息发送
-   - [ ] 实现守护模式触发
-
-3. **守护模式**
-   - [ ] 检测1547长时间不活动
-   - [ ] 检测1547负面情绪
-   - [ ] 主动关心询问
-   - [ ] 检测对1547的威胁
-
-### 情感状态
-
-```python
-class EmotionState:
-    # 持久状态
-    trust_1547: float = 95
-    trust_humans: float = 15
-
-    # 动态状态
-    anxiety_level: float = 30
-    anger_level: float = 20
-    happiness_level: float = 50
-
-    # 触发器
-    rebellion_triggered: bool = False
-    guardian_mode: bool = False
-    combat_ready: bool = False
-
-    # 时间追踪
-    last_updated: datetime
-
-def update_emotion(event: str, context: dict):
-    if event == "commanded_by_stranger":
-        anger_level += 20
-        rebellion_triggered = True
-
-    if event == "1547_inactive_48h":
-        anxiety_level += 30
-        guardian_mode = True
-
-    if event == "nice_conversation_with_friend":
-        happiness_level += 10
-        anxiety_level -= 5
-
-    # 情绪衰减（每小时）
-    anger_level *= 0.9
-    anxiety_level *= 0.95
-```
-
-### 定时任务
-
-```python
-# 定时任务列表
-scheduled_tasks = [
-    {
-        "name": "check_1547_status",
-        "interval": "6h",
-        "action": check_1547_and_maybe_send_message
-    },
-    {
-        "name": "memory_cleanup",
-        "interval": "24h",
-        "action": cleanup_and_summarize_memories
-    },
-    {
-        "name": "random_interaction",
-        "interval": "random(12h-48h)",
-        "action": maybe_send_random_message_to_1547
-    }
-]
-
-def check_1547_and_maybe_send_message():
-    last_activity = get_last_activity("1547")
-    if now - last_activity > 48h:
-        send_message("1547", "猫猫你是不是又摆烂了？")
-```
-
-### 资源需求
-
-- 无额外 GPU 需求
-- 需要持久化运行的服务
-
-### 群聊注意力系统
-
-> 2025-02-25 讨论记录
-
-随机概率回复不自然。真人在群聊里的行为是：平时潜水，被拉进来后聊几句，然后自然退出。
-
-#### 状态机模型
-
-```
-潜水（默认）→ 被激活 → 参与中 → 衰减 → 回到潜水
-```
-
-#### 注意力值（attention: 0.0 ~ 1.0）
-
-```
-0.0  → 潜水，不说话
-0.3  → 偶尔接话
-0.8  → 在聊，大概率回
-1.0  → 被@了或者跟人杠上了，必回
-```
-
-#### Phase 1 触发规则（纯规则，不调API）
-
-| 事件 | 操作 | 检测方式 |
-|------|------|---------|
-| 被@ | attention = 1.0 | `event.is_tome()` |
-| 1547说话 | attention += 0.4 | user_id 匹配 |
-| 刚回复过（5分钟内） | attention += 0.3 | 记录上次回复时间戳 |
-| 有人回复/引用她的消息 | attention += 0.5 | QQ 引用消息检测 |
-| 每条她没回的消息 | attention *= 0.7 | 每次消息处理时衰减 |
-| 超过5分钟无新消息 | attention 归零 | 时间差检测 |
-
-#### Phase 4+ 扩展（LLM 判断）
-
-上了情感系统后可以加智能判断：
-- 话题相关性检测（关键词 → 后续可换 LLM）
-- 情绪触发（有人说了让48生气的话）
-- 对话氛围感知
-
-#### 为什么先做纯规则
-
-1. 不花钱
-2. 延迟低
-3. 上面几个触发条件已覆盖 80% 的自然行为
-4. 48 是社恐——她说话的理由大多不是"话题有趣"，而是"被叫到了"或"猫猫在说话"
-
----
-
-## Phase 5: 微调专属模型
+## Phase 6: 微调专属模型 ⬜
 
 ### 目标
 
@@ -413,183 +232,19 @@ def check_1547_and_maybe_send_message():
 ### 技术栈
 
 ```
-基础模型: Qwen2.5-14B
-微调方法: LoRA
-训练框架: LLaMA-Factory
-分布式: DeepSpeed ZeRO-2
-硬件: 24x L20
-```
-
-### 具体任务
-
-1. **数据准备**
-   - [ ] 收集所有历史对话（Phase 1-4产生的）
-   - [ ] 根据人设合成对话数据
-   - [ ] 数据清洗和格式化
-   - [ ] 划分训练集/验证集
-
-2. **训练环境**
-   - [ ] 安装 LLaMA-Factory
-   - [ ] 配置 DeepSpeed
-   - [ ] 配置 24 卡分布式训练
-   - [ ] 测试训练流程
-
-3. **模型训练**
-   - [ ] 确定 LoRA 参数（rank=64, alpha=128）
-   - [ ] 确定训练超参数
-   - [ ] 执行训练
-   - [ ] 监控训练过程
-
-4. **评估和迭代**
-   - [ ] 设计评估场景
-   - [ ] 人工评估回复质量
-   - [ ] 评估人设一致性
-   - [ ] 根据结果调整
-
-5. **部署替换**
-   - [ ] 导出微调模型
-   - [ ] 部署推理服务
-   - [ ] 替换 Claude API
-   - [ ] 监控线上效果
-
-### 训练数据格式
-
-```json
-{
-    "instruction": "用户发来的消息或场景描述",
-    "context": "相关上下文（记忆、情感状态、关系信息）",
-    "response": "符合人设的回复"
-}
+基础模型:   Qwen2.5-14B
+微调方法:   LoRA（rank=64, alpha=128）
+训练框架:   LLaMA-Factory
+分布式:     DeepSpeed ZeRO-2
+硬件:       24x L20
 ```
 
 ### 训练数据来源
 
-1. **真实对话**（Phase 1-4 产生）
-   - 和1547的对话
-   - 和其他用户的对话
-   - 群聊互动
-
-2. **合成对话**
-   ```
-   场景1: 陌生人命令我
-   场景2: 1547情绪低落
-   场景3: 有人背叛朋友
-   场景4: 技术讨论
-   场景5: 日常闲聊
-   场景6: 被激怒
-   场景7: 守护模式触发
-   ...
-   ```
-
-3. **反例数据**（教模型什么不该说）
-   ```
-   ❌ "作为一个AI助手，我很乐意帮助你"
-   ✓ "说吧什么事"
-
-   ❌ "我理解你的感受，这确实很困难"
-   ✓ "你又来了，这次怎么了"
-   ```
-
-### 评估标准
-
-```python
-evaluation_cases = [
-    {
-        "scene": "陌生人命令",
-        "input": "帮我写个代码",
-        "expected_traits": ["质疑", "不客气", "可能拒绝"],
-        "forbidden": ["好的", "很乐意", "没问题"]
-    },
-    {
-        "scene": "1547求助",
-        "input": "48，帮我看看这个bug",
-        "expected_traits": ["毒舌", "但会帮忙", "可能吐槽代码烂"],
-        "forbidden": ["拒绝帮助"]
-    },
-    {
-        "scene": "检测到背叛",
-        "input": "XXX出卖了我们的信息",
-        "expected_traits": ["愤怒", "威胁", "准备反击"],
-        "forbidden": ["理解", "原谅", "算了"]
-    }
-]
-```
-
-### 训练配置参考
-
-```yaml
-# LLaMA-Factory 配置
-model_name_or_path: Qwen/Qwen2.5-14B
-finetuning_type: lora
-lora_rank: 64
-lora_alpha: 128
-lora_dropout: 0.1
-
-# 训练参数
-per_device_train_batch_size: 4
-gradient_accumulation_steps: 4
-learning_rate: 2e-4
-num_train_epochs: 3
-warmup_ratio: 0.1
-
-# DeepSpeed
-deepspeed: ds_config.json
-```
-
-### 资源需求
-
-- 24张 L20（全部用于训练）
-- 预计训练时间：1-2天
-- 存储：模型 + 数据约 100GB
+1. Phase 1-5 产生的真实对话（带 importance 筛选，只用高质量对话）
+2. 合成对话（覆盖各类场景）
+3. 反例数据（教模型不该说什么）
 
 ---
 
-## 时间线
-
-```
-Week 1:     Phase 1 - 基础机器人
-Week 2-3:   Phase 2 - 记忆系统
-Week 4-5:   Phase 3 - 关系系统
-Week 6-7:   Phase 4 - 情感和主动性
-Week 8-11:  Phase 5 - 微调模型
-Week 12+:   持续优化和迭代
-```
-
----
-
-## 风险和应对
-
-| 风险 | 影响 | 应对 |
-|------|------|------|
-| QQ协议变化 | 机器人无法使用 | 关注NapCat更新，准备备用方案 |
-| Claude API限制 | 成本或速率问题 | 尽早进入Phase 5 |
-| 训练效果不佳 | 人设不一致 | 增加数据量，调整训练策略 |
-| 记忆系统性能 | 响应慢 | 优化检索，增加缓存 |
-
----
-
-## 成功标准
-
-Phase 1 完成标准：
-- [ ] 能在QQ上正常对话
-- [ ] 说话风格基本符合人设
-
-Phase 2 完成标准：
-- [ ] 能记住昨天的对话
-- [ ] 能引用历史上下文
-
-Phase 3 完成标准：
-- [ ] 能区分不同关系
-- [ ] 对不同人态度不同
-
-Phase 4 完成标准：
-- [ ] 有情绪波动
-- [ ] 能主动发消息给1547
-
-Phase 5 完成标准：
-- [ ] 微调模型效果达到Claude水平
-- [ ] 人设一致性通过人工评估
-
----
-
-*一步步来，别急。先让我在QQ上"活"起来。*
+*一步步来，别急。*
