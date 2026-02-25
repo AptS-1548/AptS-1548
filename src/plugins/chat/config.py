@@ -25,3 +25,17 @@ class Config(BaseModel):
     diary_limit: int = 3                # 日记（我的近况）条数
     impression_recent_limit: int = 3    # 近期印象条数
     impression_key_limit: int = 2       # 关键印象条数
+
+    # 日程生成用的日记数量（比对话时多拉一些，让日程更贴合近况）
+    schedule_diary_limit: int = 10      # 近期日记条数
+    schedule_diary_key_limit: int = 10  # 重要日记条数
+
+    # 主动行为
+    proactive_check_sec: int = 7200     # 检查间隔（秒），默认 2 小时
+    proactive_cooldown_sec: int = 21600 # 主动消息冷却（秒），默认 6 小时
+    proactive_max_daily: int = 2        # 每天最多主动几次
+
+    # 日记自动去重
+    diary_dedup_enabled: bool = False   # 是否启用每日自动去重
+    diary_dedup_threshold: float = 0.85 # 语义相似度阈值
+    diary_dedup_window: int = 15        # 时间窗口（分钟）

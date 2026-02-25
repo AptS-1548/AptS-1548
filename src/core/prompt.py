@@ -159,9 +159,10 @@ def format_impressions(impressions: list) -> str:
     return "## 印象记录\n" + "\n".join(lines)
 
 
-def format_diary(entries: list) -> str:
+def format_diary(entries: list, show_time: bool = False) -> str:
     """将日记列表格式化为可注入 system prompt 的文本。
-    ≤6天用相对时间，≥7天用具体日期，让 LLM 能感知时间跨度。
+    ≤6天用相对时间，≥7天用具体日期。
+    show_time=True 时显示具体时分（供日程生成使用）。
     """
     if not entries:
         return ""
@@ -171,9 +172,9 @@ def format_diary(entries: list) -> str:
         d = dt.fromtimestamp(e.timestamp)
         delta = (today - d.date()).days
         if delta == 0:
-            t = "今天"
+            t = f"今天 {d.strftime('%H:%M')}" if show_time else "今天"
         elif delta == 1:
-            t = "昨天"
+            t = f"昨天 {d.strftime('%H:%M')}" if show_time else "昨天"
         elif delta < 7:
             t = f"{delta}天前"
         else:
@@ -190,6 +191,7 @@ def build_system_prompt(
     impression_context: str = "",
     relationship_context: str = "",
     diary_context: str = "",
+    schedule_context: str = "",
 ) -> tuple[str, str]:
     """返回 (stable, dynamic) 两段 system prompt。
     stable 部分不变可缓存，dynamic 部分每次不同不缓存。
@@ -200,6 +202,9 @@ def build_system_prompt(
     dynamic_parts = [
         f"## 当前时间\n{now.strftime('%Y-%m-%d %H:00')} {_WEEKDAYS[now.weekday()]}"
     ]
+
+    if schedule_context:
+        dynamic_parts.append(schedule_context)
 
     if diary_context:
         dynamic_parts.append(diary_context)
@@ -216,8 +221,8 @@ def build_system_prompt(
         dynamic_parts.append(
             "## 当前对话对象\n"
             "你正在和 1547（猫猫）对话。她是你的创造者和朋友。\n"
-            '用毒舌但关心的方式和他说话。叫他"猫猫"或"你小子"。\n'
-            "他如果状态不好，你要拽他回来。"
+            '用毒舌但关心的方式和她说话。叫她"猫猫"或"你小子"。\n'
+            "她如果状态不好，你要拽她回来。"
         )
     else:
         dynamic_parts.append(
@@ -235,7 +240,8 @@ def build_system_prompt(
     else:
         dynamic_parts.append(
             "## 当前场景：私聊\n"
-            "可以多说几句，但依然直接、不废话。"
+            "可以多说几句，但依然直接、不废话。\n"
+            "如果你在睡觉或者真的不想理对方，回复[不回复]。但如果是47找你，除非你真的已经关机了，否则还是要回。"
         )
 
     return PERSONALITY, "\n\n".join(dynamic_parts)

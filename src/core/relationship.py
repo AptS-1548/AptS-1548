@@ -20,6 +20,7 @@ class UserProfile:
     interaction_count: int = 0
     is_enemy: bool = False
     enemy_until: float = 0.0  # Unix timestamp，敌对状态到期时间
+    last_interaction: float = 0.0  # 最后一次互动的 Unix 时间戳
     summary: str = ""          # LLM 生成的一句话认知摘要
     facts: list = field(default_factory=list)  # 从对话中提取的事实性信息
 
@@ -56,6 +57,7 @@ class RelationshipManager:
         if user_name:
             p.user_name = user_name
         p.interaction_count += 1
+        p.last_interaction = time.time()
 
         if trust_delta != 0:
             old = p.trust
@@ -155,6 +157,35 @@ class RelationshipManager:
         if p.summary:
             text += f"\n你对ta的了解：{p.summary}"
         return text
+
+    def get_friends(self, owner_id: str) -> list[UserProfile]:
+        """返回所有 friend 级别的用户（trust >= 60，不含 owner）。"""
+        return [
+            p for p in self._profiles.values()
+            if p.user_id != owner_id
+            and not p.is_enemy
+            and p.trust >= 60
+        ]
+
+    def find_by_activity(self, activity: str, owner_id: str) -> list[str]:
+        """在活动文本中匹配已知用户名，返回匹配到的 user_id 列表。
+
+        匹配逻辑：user_name 的任何 >= 2 字的子串出现在 activity 中。
+        跳过 owner（owner 走单独的主动逻辑）。
+        """
+        matched = []
+        for p in self._profiles.values():
+            if p.user_id == owner_id or not p.user_name:
+                continue
+            # 用 user_name 直接匹配，也尝试去掉姓的短名
+            names_to_check = [p.user_name]
+            if len(p.user_name) >= 3:
+                names_to_check.append(p.user_name[1:])  # 去掉姓
+            for name in names_to_check:
+                if len(name) >= 2 and name in activity:
+                    matched.append(p.user_id)
+                    break
+        return matched
 
     def _load(self):
         if not os.path.exists(self._path):

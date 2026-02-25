@@ -7,7 +7,7 @@ Phase 1: 基础行为系统      ✅ 完成   ← 注意力、防抖、冷却、
 Phase 2: 长期记忆          ✅ 完成   ← Qdrant 向量存储、检索注入、重启重建
 Phase 3: 记忆进化          ✅ 完成   ← 评估系统、分层印象、事实提取、周期摘要
 Phase 4: 关系系统          ✅ 完成   ← 信任等级、用户画像、敌对机制
-Phase 5: 主动行为          🚧 进行中 ← 自我记录（diary）→ 主动关心 → 故事RAG
+Phase 5: 主动行为          🚧 进行中 ← diary → 日程 → 主动关心 → 日记去重 → 故事RAG
 Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替换 Claude API
 ```
 
@@ -133,7 +133,8 @@ enemy       is_enemy=True → 敌对状态，最低 10 年
 **UserProfile 字段**
 ```python
 user_id, user_name, trust, first_seen,
-interaction_count, is_enemy, enemy_until,
+interaction_count, last_interaction,
+is_enemy, enemy_until,
 summary,   # 一句话认知摘要
 facts,     # 从对话提取的事实列表
 ```
@@ -174,6 +175,8 @@ facts,     # 从对话提取的事实列表
 **存储**
 - `record_type="diary"`, `user_id="48"`，与用户记忆隔离
 - 存入 Qdrant，不参与用户维度的检索
+- **语义去重**：存储前用向量搜索最近 24h 的日记，cosine >= 0.85 视为重复跳过
+- 存储日志细化：`记忆存储 | type=diary user=48 msg=...`
 
 **检索与注入**
 - `memory.get_diary()`：近期 N 条 + 向量搜索相关日记，合并去重
@@ -190,22 +193,84 @@ facts,     # 从对话提取的事实列表
 
 ---
 
-### 5.2 主动行为触发 ⬜
+### 5.2 日程系统（schedule）✅
 
-**触发条件**（依赖 5.1 diary 提供自我状态感知）
+**已完成内容**
 
-- owner 超过 N 小时没联系，且最近印象有情绪波动
-- 高 importance 事件后的跟进（"你上次说感冒了，好点了吗"）
-- 随机低频主动（极低概率，不能烦人）
+**日程生成（`core/schedule.py`）**
+- 启动时立即生成 + 每天凌晨 1:00 自动重生成
+- LLM 结合 diary 生成当天日程（8~12 条），覆盖 0:00~23:59
+- 格式 `HH:MM|活动|意愿度(0.0~1.0)`，解析为 `ScheduleEntry`
+- LLM 未覆盖凌晨时自动补 `0:00|睡觉|0.0`
+- 生成失败重试 3 次，全部失败使用默认日程兜底
+- 存在内存（当天有效），同一天只生成一次
 
-**定时 loop**
-- 每 6h 检查 owner 状态
-- 结合 diary 判断 48 自己当前是否"有话要说"
-- 如果触发，生成一条符合当前状态的主动消息
+**日程生成数据**
+- 启动/凌晨重生成时拉取日记作为上下文（`SCHEDULE_DIARY_LIMIT` + `SCHEDULE_DIARY_KEY_LIMIT`）
+- 日记带具体时间显示（`show_time=True`），让 LLM 感知时间线
+- 对话时触发的日程生成也带 diary 上下文
+
+**日程影响回复行为 — 分群聊/私聊两层**
+
+群聊（不调 LLM，省 API）：
+- `_time_multiplier()` 代理到 `get_willingness()`，替代硬编码时段表
+- 乘数接入现有注意力系统，被@ 仍然无视日程直接回
+
+私聊（LLM 自己决定）：
+- 日程注入 prompt（`## 我现在在做什么`）
+- prompt 规则：在睡觉或不想理时回复 `[不回复]`
+- 代码检测 `[不回复]` 标记则不发送，历史记为 `(已读不回)`
+
+**其他效果**
+- 被问"你在干嘛" → 回答和当前日程活动一致
+- 语气受当前活动影响：巡逻时简短，空闲时松一点
 
 ---
 
-### 5.3 故事 RAG ⬜
+### 5.3 主动行为触发 ✅
+
+**已完成内容**
+
+**硬性门槛（代码过滤，不调 LLM）**
+- 日程意愿度 >= 0.3（不在睡觉/忙的时候不主动）
+- 冷却期 6h（上次主动后 6 小时内不再主动）
+- 每日上限 2 次
+- 跟 owner 至少 2h 没聊过
+
+**软性判断（LLM 决定）**
+- 收集：48 的日记、对 owner 的印象、当前活动、沉默时长
+- LLM 自行判断要不要说、说什么
+- 输出 `[不主动]` 则跳过
+
+**三种主动触发**
+
+1. **周期性找 owner**：owner 沉默 >= 2h 时 LLM 判断要不要说
+2. **周期性找朋友**：随机选一个 friend 级别用户，沉默 >= 6h 时 LLM 判断，冷却翻倍
+3. **日程驱动**：日程提到某人（"和沐川对设计"），到了该时段自动给对应的人发消息
+
+**定时 loop**
+- `_proactive_loop()`：启动后等 5 分钟，之后每 `PROACTIVE_CHECK_SEC`（默认 2h）检查
+- 通过 `nonebot.get_bot()` 获取 Bot 实例，无需 incoming event
+- 统一 `_send_proactive()` 处理：推入历史 + 发送 + 存记忆
+
+**日程匹配**
+- `relationship.find_by_activity()`：在活动文本中匹配已知用户名（全名 + 去姓短名）
+- 每个日程条目只触发一次（按 `日期_时间` 去重）
+- 30 分钟时间窗口内匹配
+
+**数据支撑**
+- `UserProfile.last_interaction`：新增字段，`record_interaction()` 时自动更新
+- owner 对话现在也调 `record_interaction()` 更新互动时间
+- `relationship.get_friends()`：返回所有 trust >= 60 的用户
+
+**配置项**
+- `PROACTIVE_CHECK_SEC=7200`（检查间隔）
+- `PROACTIVE_COOLDOWN_SEC=21600`（冷却，朋友翻倍）
+- `PROACTIVE_MAX_DAILY=2`（每日上限）
+
+---
+
+### 5.4 故事 RAG ⬜
 
 **现有故事检索**
 - 数据源：`weare-website/story-website` 中的故事章节

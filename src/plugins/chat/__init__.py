@@ -5,6 +5,7 @@ import random
 import time
 from collections import defaultdict, deque
 
+import nonebot
 from nonebot import on_message, get_driver, get_plugin_config, logger
 from nonebot.adapters.onebot.v11 import (
     Bot,
@@ -22,6 +23,8 @@ from core.eval import evaluate_exchange, evaluate_batch
 from core.relationship import RelationshipManager
 from core.summarize import generate_user_summary
 from core.diary import generate_diary_entry
+from core.schedule import ensure_schedule, get_willingness, format_schedule_context, schedule_daily_loop
+from core.proactive import check_proactive, check_schedule_proactive, generate_schedule_message
 
 from .config import Config
 
@@ -158,13 +161,11 @@ def _density_multiplier(group_id: str) -> float:
 
 
 def _time_multiplier() -> float:
-    """根据当前时段返回注意力乘数"""
-    hour = datetime.datetime.now().hour
-    if hour < 7:    return 0.2   # 深夜，基本不回
-    if hour < 9:    return 0.5   # 早上，慢慢醒
-    if hour < 18:   return 0.8   # 白天
-    if hour < 23:   return 1.0   # 傍晚，最活跃
-    return 0.5                   # 深夜前，开始懒了
+    """从日程系统获取当前意愿度，替代硬编码时段表。"""
+    w = get_willingness()
+    if w > 0:
+        return w
+    return 0.05  # 睡觉时保留极低概率（被@仍会回）
 
 
 def _should_reply_group(att: float) -> bool:
@@ -195,7 +196,143 @@ driver = get_driver()
 async def _startup():
     asyncio.create_task(_attention_decay_loop())
     asyncio.create_task(_rebuild_context())
-    asyncio.create_task(memory.cleanup_old_entries())  # Fix 7: 启动时异步清理旧低价值记忆
+    asyncio.create_task(memory.cleanup_old_entries())
+    asyncio.create_task(_init_schedule())
+    asyncio.create_task(schedule_daily_loop(_get_diary_context))
+    asyncio.create_task(_proactive_loop())
+    if plugin_config.diary_dedup_enabled:
+        asyncio.create_task(_diary_dedup_loop())
+
+
+async def _get_diary_context() -> str:
+    """拉取日记供日程生成使用（比对话时多拉）。"""
+    diary_entries = await memory.get_diary(
+        recent_limit=plugin_config.schedule_diary_limit,
+        key_limit=plugin_config.schedule_diary_key_limit,
+    )
+    return format_diary(diary_entries, show_time=True) if diary_entries else ""
+
+
+async def _init_schedule():
+    """启动时拉取日记，生成今天的日程。"""
+    await asyncio.sleep(10)
+    logger.info("启动日程初始化...")
+    try:
+        diary_entries = await memory.get_diary(
+            recent_limit=plugin_config.schedule_diary_limit,
+            key_limit=plugin_config.schedule_diary_key_limit,
+        )
+        diary_context = format_diary(diary_entries, show_time=True) if diary_entries else ""
+        logger.info(f"日程初始化 | 拉取 {len(diary_entries)} 条日记")
+        if diary_context:
+            logger.info(f"日程初始化 | 日记内容:\n{diary_context}")
+    except Exception:
+        diary_context = ""
+    await ensure_schedule(diary_context=diary_context, force=True)
+
+
+async def _send_proactive(bot: Bot, target_id: str, msg: str, label: str = ""):
+    """发送主动消息的统一逻辑：推入历史 + 发送 + 存记忆。"""
+    _push_private(target_id, "assistant", msg)
+    try:
+        await bot.send_private_msg(user_id=int(target_id), message=Message(msg))
+    except Exception as e:
+        logger.warning(f"主动消息发送失败 | {label} {e}")
+        return
+    await memory.store(MemoryEntry(
+        user_id=target_id,
+        chat_type="private",
+        chat_id=target_id,
+        user_name="48",
+        message="(主动发起)",
+        response=msg,
+        importance=0.5,
+        record_type="dialog",
+    ))
+    logger.info(f"主动消息 | → {label} | {msg!r}")
+
+
+async def _diary_dedup_loop():
+    """后台循环：每天 0:30 自动执行日记语义去重。"""
+    import datetime as _dt
+    while True:
+        now = _dt.datetime.now()
+        target = now.replace(hour=0, minute=30, second=0, microsecond=0)
+        if now >= target:
+            target += _dt.timedelta(days=1)
+        wait_sec = (target - now).total_seconds()
+        logger.debug(f"日记去重 loop | 下次执行 {target.strftime('%H:%M')}，等待 {wait_sec:.0f}s")
+        await asyncio.sleep(wait_sec)
+
+        try:
+            deleted = await memory.dedup_diary(
+                threshold=plugin_config.diary_dedup_threshold,
+                window_min=plugin_config.diary_dedup_window,
+            )
+            if deleted:
+                logger.info(f"日记去重 loop | 完成，删除 {deleted} 条")
+        except Exception as e:
+            logger.warning(f"日记去重 loop | 失败: {e}")
+
+
+async def _proactive_loop():
+    """后台定时检查，触发 48 主动联系 owner 和朋友。"""
+    await asyncio.sleep(300)  # 启动后等 5 分钟再开始
+    logger.info(f"主动 loop 启动 | 间隔={plugin_config.proactive_check_sec}s 冷却={plugin_config.proactive_cooldown_sec}s")
+
+    while True:
+        await asyncio.sleep(plugin_config.proactive_check_sec)
+        try:
+            bot: Bot = nonebot.get_bot()
+        except ValueError:
+            continue
+
+        owner_id = plugin_config.owner_id
+
+        # ── Part 1: 日程驱动 ──
+        try:
+            schedule_contacts = await check_schedule_proactive(relationship, owner_id)
+            for target_id, activity in schedule_contacts:
+                msg = await generate_schedule_message(target_id, activity, relationship, owner_id)
+                if msg:
+                    name = relationship.get(target_id).user_name or target_id
+                    await _send_proactive(bot, target_id, msg, label=f"日程→{name}")
+        except Exception as e:
+            logger.warning(f"日程主动检查异常 | {e}")
+
+        # ── Part 2: 周期性检查 owner ──
+        try:
+            msg = await check_proactive(
+                target_id=owner_id,
+                owner_id=owner_id,
+                memory=memory,
+                relationship=relationship,
+                cooldown_sec=plugin_config.proactive_cooldown_sec,
+                max_daily=plugin_config.proactive_max_daily,
+            )
+            if msg:
+                await _send_proactive(bot, owner_id, msg, label="owner")
+        except Exception as e:
+            logger.warning(f"主动检查异常(owner) | {e}")
+
+        # ── Part 3: 随机选一个 friend 检查 ──
+        try:
+            friends = relationship.get_friends(owner_id)
+            if friends:
+                friend = random.choice(friends)
+                msg = await check_proactive(
+                    target_id=friend.user_id,
+                    owner_id=owner_id,
+                    memory=memory,
+                    relationship=relationship,
+                    cooldown_sec=plugin_config.proactive_cooldown_sec,
+                    max_daily=plugin_config.proactive_max_daily,
+                    min_silence_hours=6.0,  # 朋友沉默阈值更高
+                )
+                if msg:
+                    await _send_proactive(bot, friend.user_id, msg, label=friend.user_name or friend.user_id)
+        except Exception as e:
+            logger.warning(f"主动检查异常(friend) | {e}")
 
 
 async def _rebuild_context():
@@ -312,6 +449,12 @@ async def _write_diary_entry(
     entry_text = await generate_diary_entry(user_name, message, response, importance, trust, recent_context, recent_diary)
     if not entry_text:
         return
+
+    # 语义去重：和最近 24h 的日记对比，太像就不存
+    if await memory.is_diary_duplicate(entry_text):
+        logger.debug(f"日记跳过 | 语义重复: {entry_text!r}")
+        return
+
     await memory.store(MemoryEntry(
         user_id="48",
         chat_type="private",
@@ -331,8 +474,9 @@ async def _evaluate_and_store(
 ):
     """将对话记录存入 Qdrant，eval 部分丢进 buffer 攒批处理。"""
 
-    # owner 跳过 eval，直接存 + 写日记
+    # owner 跳过 eval，直接存 + 写日记 + 更新互动时间
     if user_id == plugin_config.owner_id:
+        relationship.record_interaction(user_id, user_name, 0.5, 0)
         await memory.store(MemoryEntry(
             user_id=user_id,
             chat_type=chat_type,
@@ -515,6 +659,10 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     memory_context = format_memories(memories)
     impression_context = format_impressions(impressions)
     diary_context = format_diary(diary_entries)
+
+    await ensure_schedule(diary_context=diary_context)
+    schedule_context = format_schedule_context()
+
     rel_level = relationship.trust_level(user_id, plugin_config.owner_id)
     rel_context = relationship.format_context(user_id, user_name, plugin_config.owner_id)
     logger.debug(f"[{_tid()}] 关系 | user={user_name} level={rel_level} trust={relationship.get(user_id).trust:.1f}")
@@ -533,6 +681,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         impression_context=impression_context,
         relationship_context=rel_context,
         diary_context=diary_context,
+        schedule_context=schedule_context,
     )
 
     if is_group:
@@ -553,6 +702,12 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         return
 
     logger.info(f"[{_tid()}] LLM ← | user={user_id} len={len(response)} time={elapsed:.1f}s")
+
+    # 私聊：48 可以选择不回复（日程系统驱动）
+    if not is_group and "[不回复]" in response:
+        logger.info(f"[{_tid()}] 48 选择不回复 | user={user_id}")
+        _push_private(user_id, "assistant", "(已读不回)")
+        return
 
     if is_group:
         _push_group(group_id, plugin_config.bot_name, response)

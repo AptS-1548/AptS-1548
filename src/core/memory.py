@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 
 from nonebot import logger
 from qdrant_client import QdrantClient
+import numpy as np
 from qdrant_client.models import (
     Direction,
     Distance,
@@ -17,6 +18,7 @@ from qdrant_client.models import (
     Filter,
     MatchValue,
     OrderBy,
+    PointIdsList,
     PointStruct,
     Range,
     ScalarQuantization,
@@ -172,7 +174,8 @@ class Memory:
             None,
             lambda: self._client.upsert(collection_name=COLLECTION, points=points),
         )
-        logger.debug(f"记忆 | 批量存储 {len(entries)} 条")
+        for e in entries:
+            logger.debug(f"记忆存储 | type={e.record_type} user={e.user_name} msg={e.message[:50]!r}")
 
     # ── 检索 ──
 
@@ -448,6 +451,30 @@ class Memory:
         merged.sort(key=lambda x: x.timestamp)
         return merged
 
+    async def is_diary_duplicate(self, text: str, threshold: float = 0.85, hours: int = 24) -> bool:
+        """检查最近 N 小时内是否已存在语义相似的日记。"""
+        loop = asyncio.get_running_loop()
+        vector = await loop.run_in_executor(None, self._embed, text)
+        cutoff = time.time() - hours * 3600
+
+        results = await loop.run_in_executor(None, lambda: self._client.query_points(
+            collection_name=COLLECTION,
+            query=vector,
+            query_filter=Filter(must=[
+                FieldCondition(key="record_type", match=MatchValue(value="diary")),
+                FieldCondition(key="user_id", match=MatchValue(value="48")),
+                FieldCondition(key="timestamp", range=Range(gte=cutoff)),
+            ]),
+            limit=1,
+            with_payload=True,
+        ).points)
+
+        if results and results[0].score >= threshold:
+            dup_msg = results[0].payload.get("message", "")
+            logger.debug(f"日记去重 | 相似度 {results[0].score:.3f} >= {threshold} | 已有: {dup_msg!r}")
+            return True
+        return False
+
     async def cleanup_old_entries(self, days: int = 90, importance_threshold: float = 0.2) -> None:
         """Fix 7: 删除超过 N 天且 importance 低于阈值的 dialog，防止数据库无限增长。
         impression / diary / 高重要度记录不受影响。
@@ -469,6 +496,91 @@ class Memory:
             logger.info(f"记忆 | TTL 清理：删除 {days} 天前 importance<{importance_threshold} 的 dialog")
         except Exception as e:
             logger.warning(f"记忆 | TTL 清理失败: {e}")
+
+    async def dedup_diary(self, threshold: float = 0.85, window_min: float = 15.0) -> int:
+        """日记语义去重：删除时间接近且语义相似的重复日记。
+
+        条件同时满足才算重复：cosine >= threshold 且 时间间隔 <= window_min 分钟。
+        返回删除条数。
+        """
+        loop = asyncio.get_running_loop()
+
+        # 拉全部日记（时间正序）
+        diary_filter = Filter(must=[
+            FieldCondition(key="record_type", match=MatchValue(value="diary")),
+            FieldCondition(key="user_id", match=MatchValue(value="48")),
+        ])
+        all_points = []
+        offset = None
+        while True:
+            results, next_offset = await loop.run_in_executor(
+                None,
+                lambda o=offset: self._client.scroll(
+                    collection_name=COLLECTION,
+                    scroll_filter=diary_filter,
+                    limit=100,
+                    with_payload=True,
+                    with_vectors=True,
+                    order_by=OrderBy(key="timestamp", direction=Direction.ASC),
+                    offset=o,
+                ),
+            )
+            all_points.extend(results)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        if len(all_points) < 2:
+            return 0
+
+        # 提取并归一化向量
+        vectors = np.array([np.array(p.vector) for p in all_points])
+        norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+        norms[norms == 0] = 1
+        vectors = vectors / norms
+
+        window_sec = window_min * 60
+        ids_to_delete = []
+        deleted = set()
+
+        for i in range(1, len(all_points)):
+            if i in deleted:
+                continue
+            ts_i = all_points[i].payload.get("timestamp", 0)
+
+            for j in range(i - 1, -1, -1):
+                ts_j = all_points[j].payload.get("timestamp", 0)
+                if ts_i - ts_j > window_sec:
+                    break
+                if j in deleted:
+                    continue
+
+                sim = float(np.dot(vectors[i], vectors[j]))
+                if sim >= threshold:
+                    deleted.add(i)
+                    ids_to_delete.append(all_points[i].id)
+                    break
+
+        if not ids_to_delete:
+            logger.info(f"日记去重 | {len(all_points)} 条日记，无重复")
+            return 0
+
+        # 分批删除
+        for batch_start in range(0, len(ids_to_delete), 100):
+            batch = ids_to_delete[batch_start:batch_start + 100]
+            await loop.run_in_executor(
+                None,
+                lambda b=batch: self._client.delete(
+                    collection_name=COLLECTION,
+                    points_selector=PointIdsList(points=b),
+                ),
+            )
+
+        logger.info(
+            f"日记去重 | {len(all_points)} 条日记，删除 {len(ids_to_delete)} 条重复，"
+            f"剩余 {len(all_points) - len(ids_to_delete)} 条"
+        )
+        return len(ids_to_delete)
 
 
 # ── 格式化工具 ──
