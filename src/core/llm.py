@@ -1,5 +1,5 @@
 import anthropic
-from nonebot import get_driver
+from nonebot import get_driver, logger
 
 _client: anthropic.AsyncAnthropic | None = None
 
@@ -81,19 +81,47 @@ async def chat(
     return response.content[-1].text
 
 
+def _extract_json(text: str) -> dict | None:
+    """从文本提取 JSON：纯 JSON / ```json``` / 裸 {...}"""
+    import json
+    import re
+
+    text = text.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+    if not m:
+        m = re.search(r'\{[^{}]*\}', text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1) if m.lastindex else m.group(0))
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
 async def chat_structured(
     system: str,
     messages: list[dict],
     tool: dict,
-    max_tokens: int = 512,
+    max_tokens: int = 1024,
 ) -> dict:
-    """Fix 6: tool_use 强制结构化输出，LLM 直接填 schema，无需 JSON 解析。
-    返回 tool input dict，调用方直接用 data["field"]。
+    """tool_use 强制结构化输出。
+    中转 API 不支持 tool_choice 时自动 fallback：
+    1. 尝试从 text block 提取 JSON
+    2. 去掉 tools，用 prompt 要求输出 JSON 重试
     """
+    import json
+
     env = get_driver().config
     model = getattr(env, "claude_model", "claude-opus-4-6")
     client = _get_client()
 
+    # ── 第一次：tool_use 方式 ──
     response = await client.messages.create(
         model=model,
         max_tokens=max_tokens,
@@ -103,8 +131,45 @@ async def chat_structured(
         tool_choice={"type": "tool", "name": tool["name"]},
     )
 
+    # ── 检查 tool_use ──
     for block in response.content:
         if block.type == "tool_use":
+            logger.debug(f"structured | tool_use 成功 | {block.input}")
             return block.input
 
-    raise ValueError("tool_use 响应缺失")
+    # tool_use 没拿到，记录原始响应
+    raw_texts = [getattr(b, 'text', '')[:100] for b in response.content]
+    logger.info(f"structured | tool_use 未命中 | stop={response.stop_reason} texts={raw_texts}")
+
+    # ── 尝试从 text 提取 JSON ──
+    for block in response.content:
+        if block.type == "text":
+            result = _extract_json(block.text)
+            if result is not None:
+                logger.info(f"structured | text fallback 成功 | {result}")
+                return result
+
+    # ── 第二次：去掉 tools，用 prompt 直接要 JSON ──
+    logger.info("structured | text 为空，prompt JSON 重试...")
+    schema = json.dumps(tool["input_schema"], ensure_ascii=False, indent=2)
+    json_system = (
+        f"{system}\n\n"
+        f"请严格按以下 JSON schema 回复，只输出一个 JSON 对象，不要任何其他文字：\n{schema}"
+    )
+
+    retry = await client.messages.create(
+        model=model,
+        max_tokens=max_tokens,
+        system=[{"type": "text", "text": json_system, "cache_control": {"type": "ephemeral"}}],
+        messages=messages,
+    )
+
+    for block in retry.content:
+        if block.type == "text":
+            result = _extract_json(block.text)
+            if result is not None:
+                logger.info(f"structured | prompt JSON 重试成功 | {result}")
+                return result
+            logger.warning(f"structured | prompt JSON 也失败 | text={block.text[:200]!r}")
+
+    raise ValueError("structured 输出失败：tool_use 和 prompt JSON 均无法获取结果")

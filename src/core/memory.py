@@ -356,6 +356,98 @@ class Memory:
 
         return merged
 
+    async def get_diary(
+        self,
+        query: str = "",
+        recent_limit: int = 3,
+        search_limit: int = 5,
+        key_limit: int = 5,
+    ) -> list[MemoryEntry]:
+        """取日记：近期 N 条 + 相关日记（有 query 走向量搜索，无 query 走 importance≥0.7）。
+        合并去重后按时间正序返回。
+        """
+        base_filter = [
+            FieldCondition(key="record_type", match=MatchValue(value="diary")),
+            FieldCondition(key="user_id", match=MatchValue(value="48")),
+        ]
+        loop = asyncio.get_running_loop()
+
+        if query:
+            # 有 query：近期 3 条 + 向量搜索 5 条（相关历史）
+            vector = await loop.run_in_executor(None, self._embed, query)
+            (recent_results, _), search_results = await asyncio.gather(
+                loop.run_in_executor(None, lambda: self._client.scroll(
+                    collection_name=COLLECTION,
+                    scroll_filter=Filter(must=base_filter),
+                    limit=recent_limit,
+                    with_payload=True,
+                    with_vectors=False,
+                    order_by=OrderBy(key="timestamp", direction=Direction.DESC),
+                )),
+                loop.run_in_executor(None, lambda: self._client.query_points(
+                    collection_name=COLLECTION,
+                    query=vector,
+                    query_filter=Filter(must=base_filter),
+                    limit=search_limit,
+                    with_payload=True,
+                ).points),
+            )
+            secondary = [r for r in search_results if r.score >= 0.4]
+        else:
+            # 无 query：近期 3 条 + importance≥0.7 的关键日记
+            key_filter = base_filter + [FieldCondition(key="importance", range=Range(gte=0.7))]
+            (recent_results, _), (secondary_raw, _) = await asyncio.gather(
+                loop.run_in_executor(None, lambda: self._client.scroll(
+                    collection_name=COLLECTION,
+                    scroll_filter=Filter(must=base_filter),
+                    limit=recent_limit,
+                    with_payload=True,
+                    with_vectors=False,
+                    order_by=OrderBy(key="timestamp", direction=Direction.DESC),
+                )),
+                loop.run_in_executor(None, lambda: self._client.scroll(
+                    collection_name=COLLECTION,
+                    scroll_filter=Filter(must=key_filter),
+                    limit=key_limit,
+                    with_payload=True,
+                    with_vectors=False,
+                    order_by=OrderBy(key="importance", direction=Direction.DESC),
+                )),
+            )
+            secondary = secondary_raw
+
+        def _to_entry(r) -> MemoryEntry:
+            p = r.payload
+            return MemoryEntry(
+                user_id="48",
+                chat_type=p.get("chat_type", "private"),
+                chat_id="48",
+                user_name="48",
+                message=p["message"],
+                response="",
+                timestamp=p.get("timestamp", 0.0),
+                importance=p.get("importance", 0.6),
+                record_type="diary",
+            )
+
+        recent = [_to_entry(r) for r in recent_results]
+        other = [_to_entry(r) for r in secondary]
+
+        # 合并去重：recent 优先（最新状态），other 补充历史相关
+        seen: set[float] = set()
+        merged: list[MemoryEntry] = []
+        for e in recent:
+            if e.timestamp not in seen:
+                seen.add(e.timestamp)
+                merged.append(e)
+        for e in other:
+            if e.timestamp not in seen:
+                seen.add(e.timestamp)
+                merged.append(e)
+
+        merged.sort(key=lambda x: x.timestamp)
+        return merged
+
     async def cleanup_old_entries(self, days: int = 90, importance_threshold: float = 0.2) -> None:
         """Fix 7: 删除超过 N 天且 importance 低于阈值的 dialog，防止数据库无限增长。
         impression / diary / 高重要度记录不受影响。

@@ -15,12 +15,13 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from core.llm import chat
-from core.prompt import build_system_prompt, build_group_turns, format_impressions
+from core.prompt import build_system_prompt, build_group_turns, format_impressions, format_diary
 from core.guard import Guard
 from core.memory import Memory, MemoryEntry, format_memories
-from core.eval import evaluate_exchange
+from core.eval import evaluate_exchange, evaluate_batch
 from core.relationship import RelationshipManager
 from core.summarize import generate_user_summary
+from core.diary import generate_diary_entry
 
 from .config import Config
 
@@ -69,8 +70,15 @@ DENSITY_MULT_MIN = 0.2    # 再吵也最多压到 0.2 倍
 
 # ── 防抖：避免连续消息触发多次 LLM ──
 _pending: dict[str, asyncio.Task] = {}
-_burst_active: set[str] = set()  # 被取消过、正在冷静的会话
+_burst_active: set[str] = set()   # 被取消过、正在冷静的会话
+_burst_texts: dict[str, list[str]] = defaultdict(list)  # burst 期间积累的消息文本
 _rebuilt_private_users: set[str] = set()  # 已重建过私聊历史的用户
+
+# ── eval buffer：攒多轮一起评估 ──
+_eval_buffer: dict[str, list[dict]] = defaultdict(list)  # user_id -> [round_info, ...]
+_eval_timers: dict[str, asyncio.Task] = {}  # user_id -> flush timer
+EVAL_BATCH_SIZE = 3       # 攒满 N 轮触发 eval
+EVAL_FLUSH_TIMEOUT = 120  # 超时 N 秒自动 flush
 
 # ── 印象去重：同一用户/群 2 小时内只存一次印象（运行时 + 持久化通过 relationship）──
 IMPRESSION_COOLDOWN_SEC = 2 * 3600
@@ -261,13 +269,52 @@ async def _update_user_summary(user_id: str, user_name: str):
         logger.warning(f"摘要更新失败 | user={user_id} {e}")
 
 
+async def _write_diary_entry(
+    user_id: str,
+    user_name: str,
+    message: str,
+    response: str,
+    importance: float,
+) -> None:
+    """异步生成并存储 48 的日记条目。拉取最近印象作为上下文，让日记有更广的视野。"""
+    trust = relationship.get(user_id).trust
+
+    # 取最近印象作为背景，让 48 能结合近期发生的事来写日记
+    recent_context = ""
+    recent_diary = ""
+    try:
+        impressions = await memory.get_impressions(user_id=user_id, recent_limit=3, key_limit=2)
+        if impressions:
+            recent_context = "\n".join(f"- {m.message}" for m in impressions[:5])
+        diary_entries = await memory.get_diary(limit=3)
+        if diary_entries:
+            recent_diary = "\n".join(f"- {e.message}" for e in diary_entries)
+    except Exception:
+        pass
+
+    entry_text = await generate_diary_entry(user_name, message, response, importance, trust, recent_context, recent_diary)
+    if not entry_text:
+        return
+    await memory.store(MemoryEntry(
+        user_id="48",
+        chat_type="private",
+        chat_id="48",
+        user_name="48",
+        message=entry_text,
+        response="",
+        importance=0.6,
+        record_type="diary",
+    ))
+    logger.debug(f"日记已存 | {entry_text!r}")
+
+
 async def _evaluate_and_store(
     user_id: str, chat_type: str, chat_id: str,
     user_name: str, message: str, response: str,
 ):
-    """评估对话重要性 + 生成印象，异步存入 Qdrant。"""
+    """将对话记录存入 Qdrant，eval 部分丢进 buffer 攒批处理。"""
 
-    # Fix 6: owner 跳过 eval，省一次 API 调用，直接存对话记录
+    # owner 跳过 eval，直接存 + 写日记
     if user_id == plugin_config.owner_id:
         await memory.store(MemoryEntry(
             user_id=user_id,
@@ -279,46 +326,90 @@ async def _evaluate_and_store(
             importance=0.5,
             record_type="dialog",
         ))
+        asyncio.create_task(_write_diary_entry(user_id, user_name, message, response, importance=0.7))
         return
 
-    importance, impression, trust_delta, facts = await evaluate_exchange(user_name, message, response)
-
-    impression_key = f"{chat_type}_{chat_id}_{user_id}"
-    # Fix 4: 用 relationship 持久化的时间戳，重启后冷却不丢失
-    cooldown_ok = (
-        importance >= 0.8
-        or time.time() - relationship.get_impression_ts(impression_key) >= IMPRESSION_COOLDOWN_SEC
-    )
-    should_store_impression = impression and importance >= 0.4 and cooldown_ok
-
-    logger.debug(f"[{_tid()}] 评估 | user={user_name} importance={importance:.2f} trust_delta={trust_delta:+} facts={facts} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
-
-    relationship.record_interaction(user_id, user_name, importance, trust_delta)
-    if facts:
-        relationship.add_facts(user_id, facts)
-    p = relationship.get(user_id)
-    should_summarize = (
-        (p.interaction_count > 0 and p.interaction_count % 10 == 0)
-        or (not p.summary and p.interaction_count >= 5)
-        or abs(trust_delta) >= 3
-        or importance >= 0.8
-    )
-
-    # Fix 2: dialog + impression 合并为一次 store_batch，减少 Qdrant IO
-    entries_to_store = [MemoryEntry(
+    # 立即存 dialog（不等 eval），importance 暂用 0.5
+    await memory.store(MemoryEntry(
         user_id=user_id,
         chat_type=chat_type,
         chat_id=chat_id,
         user_name=user_name,
         message=message,
         response=response,
-        importance=importance,
+        importance=0.5,
         record_type="dialog",
-    )]
+    ))
+
+    # 把这一轮丢进 eval buffer
+    _eval_buffer[user_id].append({
+        "user_name": user_name,
+        "message": message,
+        "response": response,
+        "chat_type": chat_type,
+        "chat_id": chat_id,
+    })
+
+    buf_len = len(_eval_buffer[user_id])
+    logger.debug(f"[{_tid()}] eval buffer | user={user_name} 累计{buf_len}轮")
+
+    # 满 N 轮立即 flush
+    if buf_len >= EVAL_BATCH_SIZE:
+        _cancel_eval_timer(user_id)
+        asyncio.create_task(_flush_eval(user_id))
+    else:
+        # 没满就启动/重置超时 timer
+        _reset_eval_timer(user_id)
+
+
+def _cancel_eval_timer(user_id: str):
+    t = _eval_timers.pop(user_id, None)
+    if t and not t.done():
+        t.cancel()
+
+
+def _reset_eval_timer(user_id: str):
+    _cancel_eval_timer(user_id)
+
+    async def _timer():
+        await asyncio.sleep(EVAL_FLUSH_TIMEOUT)
+        await _flush_eval(user_id)
+
+    _eval_timers[user_id] = asyncio.create_task(_timer())
+
+
+async def _flush_eval(user_id: str):
+    """从 buffer 取出所有轮次，一次性调 eval，处理结果。"""
+    rounds_info = _eval_buffer.pop(user_id, [])
+    _cancel_eval_timer(user_id)
+
+    if not rounds_info:
+        return
+
+    # 构造 eval 输入
+    rounds = [(r["user_name"], r["message"], r["response"]) for r in rounds_info]
+    user_name = rounds_info[-1]["user_name"]
+    chat_type = rounds_info[-1]["chat_type"]
+    chat_id = rounds_info[-1]["chat_id"]
+
+    importance, impression, trust_delta, facts = await evaluate_batch(rounds)
+
+    impression_key = f"{chat_type}_{chat_id}_{user_id}"
+    cooldown_ok = (
+        importance >= 0.8
+        or time.time() - relationship.get_impression_ts(impression_key) >= IMPRESSION_COOLDOWN_SEC
+    )
+    should_store_impression = impression and importance >= 0.4 and cooldown_ok
+
+    logger.debug(f"eval flush | user={user_name} {len(rounds)}轮 imp={importance:.2f} trust={trust_delta:+} facts={facts} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
+
+    relationship.record_interaction(user_id, user_name, importance, trust_delta)
+    if facts:
+        relationship.add_facts(user_id, facts)
 
     if should_store_impression:
         relationship.set_impression_ts(impression_key, time.time())
-        entries_to_store.append(MemoryEntry(
+        await memory.store(MemoryEntry(
             user_id=user_id,
             chat_type=chat_type,
             chat_id=chat_id,
@@ -329,16 +420,29 @@ async def _evaluate_and_store(
             record_type="impression",
         ))
 
-    await memory.store_batch(entries_to_store)
-
-    # Fix 3: 在 dialog + impression 都存完后才触发摘要，确保新印象已入库
+    p = relationship.get(user_id)
+    should_summarize = (
+        (p.interaction_count > 0 and p.interaction_count % 10 == 0)
+        or (not p.summary and p.interaction_count >= 5)
+        or abs(trust_delta) >= 3
+        or importance >= 0.8
+    )
     if should_summarize:
-        logger.debug(f"[{_tid()}] 摘要触发 | user={user_name} count={p.interaction_count} trust_delta={trust_delta:+} importance={importance:.2f}")
         asyncio.create_task(_update_user_summary(user_id, user_name))
 
+    # diary：用最后一轮的内容
+    last = rounds_info[-1]
+    should_write_diary = importance >= 0.6 or abs(trust_delta) >= 3
+    if should_write_diary:
+        asyncio.create_task(_write_diary_entry(
+            user_id, user_name, last["message"], last["response"], importance,
+        ))
 
-async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool):
-    """调用 LLM 并发送回复"""
+
+async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool, search_query: str = ""):
+    """调用 LLM 并发送回复。search_query 是 burst 期间所有消息的拼合，用于记忆/日记检索；text 是最后一条，用于上下文和发送。"""
+    if not search_query:
+        search_query = text
     allowed, reject_msg = guard.check_rate(user_id, is_owner=is_owner)
     if not allowed:
         logger.warning(f"[{_tid()}] 速率限制 | user={user_id} msg={reject_msg}")
@@ -366,19 +470,21 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         except Exception as ex:
             logger.warning(f"[{_tid()}] 重建私聊历史失败 | user={user_id} {ex}")
 
-    # 检索相关历史记忆 + 最近印象
+    # 检索相关历史记忆 + 最近印象 + 48 的近况日记
     # 群聊按群隔离，私聊按人检索（群聊+私聊全捞）
     if is_group:
-        memories, impressions = await asyncio.gather(
-            memory.search(query=text, chat_id=chat_id, limit=4),
+        memories, impressions, diary_entries = await asyncio.gather(
+            memory.search(query=search_query, chat_id=chat_id, limit=4),
             memory.get_impressions(chat_id=chat_id),
+            memory.get_diary(query=search_query),
         )
     else:
-        memories, impressions = await asyncio.gather(
-            memory.search(query=text, user_id=user_id, limit=4),
+        memories, impressions, diary_entries = await asyncio.gather(
+            memory.search(query=search_query, user_id=user_id, limit=4),
             memory.get_impressions(user_id=user_id),
+            memory.get_diary(query=search_query),
         )
-    logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)}")
+    logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)} diary={len(diary_entries)}")
 
     # fallback: 短消息向量搜索无结果时，用最近几条兜底
     if not memories:
@@ -391,9 +497,12 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
             logger.debug(f"[{_tid()}] 记忆 fallback | 向量无结果，取最近 {len(fallback)} 条")
     memory_context = format_memories(memories)
     impression_context = format_impressions(impressions)
+    diary_context = format_diary(diary_entries)
     rel_level = relationship.trust_level(user_id, plugin_config.owner_id)
     rel_context = relationship.format_context(user_id, user_name, plugin_config.owner_id)
     logger.debug(f"[{_tid()}] 关系 | user={user_name} level={rel_level} trust={relationship.get(user_id).trust:.1f}")
+    if diary_context:
+        logger.debug(f"[{_tid()}] 注入日记 |\n{diary_context}")
     if memory_context:
         logger.debug(f"[{_tid()}] 注入记忆 |\n{memory_context}")
     if impression_context:
@@ -406,6 +515,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         memory_context=memory_context,
         impression_context=impression_context,
         relationship_context=rel_context,
+        diary_context=diary_context,
     )
 
     if is_group:
@@ -515,6 +625,9 @@ async def handle(bot: Bot, event: MessageEvent):
         _burst_active.add(key)
         logger.info(f"防抖取消 | {key} → burst 冷静期")
 
+    # 积累 burst 期间所有消息，防抖触发时拼合为 search_query，让记忆/日记检索覆盖整个 burst
+    _burst_texts[key].append(text)
+
     delay = BURST_COOLDOWN_SEC if key in _burst_active else DEBOUNCE_SEC
     logger.info(f"防抖等待 | {key} delay={delay:.1f}s")
 
@@ -523,8 +636,10 @@ async def handle(bot: Bot, event: MessageEvent):
         _trace_ctx.set(_new_tid())
         try:
             await asyncio.sleep(delay)
-            logger.info(f"[{_tid()}] 防抖触发 | {key} → 调用 LLM")
-            await _do_reply(bot, is_group, group_id, user_id, sender_name, text, is_owner)
+            # 取出并清空缓冲区（task 被取消时不会走到这里，缓冲继续积累）
+            search_query = " ".join(_burst_texts.pop(key, [text]))
+            logger.info(f"[{_tid()}] 防抖触发 | {key} → 调用 LLM query={search_query!r}")
+            await _do_reply(bot, is_group, group_id, user_id, sender_name, text, is_owner, search_query=search_query)
         finally:
             # 只有自己还是当前任务时才清理，避免取消后覆盖后继任务的槽位
             if _pending.get(key) is current_task:
