@@ -19,6 +19,7 @@ from qdrant_client.models import (
     OrderBy,
     PointStruct,
     Range,
+    ScalarQuantization,
     ScalarQuantizationConfig,
     ScalarType,
     VectorParams,
@@ -89,10 +90,12 @@ class Memory:
         try:
             self._client.update_collection(
                 collection_name=COLLECTION,
-                quantization_config=ScalarQuantizationConfig(
-                    type=ScalarType.INT8,
-                    quantile=0.99,
-                    always_ram=True,
+                quantization_config=ScalarQuantization(
+                    scalar=ScalarQuantizationConfig(
+                        type=ScalarType.INT8,
+                        quantile=0.99,
+                        always_ram=True,
+                    ),
                 ),
             )
             logger.info("记忆 | INT8 量化就绪")
