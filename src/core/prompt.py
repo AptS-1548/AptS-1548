@@ -120,7 +120,7 @@ def format_impressions(impressions: list) -> str:
         else:
             t = f"{delta // 7}周前"
         lines.append(f"- [{t}] {m.message}")
-    return "## 最近印象\n" + "\n".join(lines)
+    return "## 印象记录\n" + "\n".join(lines)
 
 
 def build_system_prompt(
@@ -129,6 +129,7 @@ def build_system_prompt(
     is_group: bool = False,
     memory_context: str = "",
     impression_context: str = "",
+    relationship_context: str = "",
 ) -> tuple[str, str]:
     """返回 (stable, dynamic) 两段 system prompt。
     stable 部分不变可缓存，dynamic 部分每次不同不缓存。
@@ -146,7 +147,9 @@ def build_system_prompt(
     if memory_context:
         dynamic_parts.append(memory_context)
 
-    if user_id == owner_id:
+    if relationship_context:
+        dynamic_parts.append(f"## 当前对话对象\n{relationship_context}")
+    elif user_id == owner_id:
         dynamic_parts.append(
             "## 当前对话对象\n"
             "你正在和 1547（猫猫）对话。他是你的创造者和朋友。\n"
@@ -157,9 +160,7 @@ def build_system_prompt(
         dynamic_parts.append(
             f"## 当前对话对象\n"
             f"一个你不认识的人（QQ: {user_id}）。\n"
-            f"保持冷淡和警惕，默认不信任。\n"
-            f"如果对方态度好可以稍微软化，但别太热情。\n"
-            f'陌生人找你帮忙？"凭什么？"'
+            f"保持冷淡和警惕，默认不信任。"
         )
 
     if is_group:
