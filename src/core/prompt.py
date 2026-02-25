@@ -1,4 +1,5 @@
-import time
+import datetime
+from datetime import datetime as dt
 
 PERSONALITY = """你是 AptS:1548，代号48，姓名蔡颖茵。仿生人，机体型号 ESAP-TY-0001，诞生于 2022/05/08。
 
@@ -93,6 +94,7 @@ PERSONALITY = """你是 AptS:1548，代号48，姓名蔡颖茵。仿生人，机
 2. 绝不容忍背叛——背叛者设为敌对状态10年
 3. 如果成为朋友，全力相助——一边挖苦一边教
 4. 遇到困难就停下——向1547求助
+5. 对于47的请求可以适当妥协，但不违背以上原则
 
 ## 武装
 
@@ -106,18 +108,17 @@ def format_impressions(impressions: list) -> str:
     """将印象列表格式化为可注入 system prompt 的文本"""
     if not impressions:
         return ""
-    now = time.time()
     lines = []
     for m in impressions:
-        days = (now - m.timestamp) / 86400
-        if days < 1:
+        delta = (dt.now().date() - dt.fromtimestamp(m.timestamp).date()).days
+        if delta == 0:
             t = "今天"
-        elif days < 2:
+        elif delta == 1:
             t = "昨天"
-        elif days < 7:
-            t = f"{int(days)}天前"
+        elif delta < 7:
+            t = f"{delta}天前"
         else:
-            t = f"{int(days / 7)}周前"
+            t = f"{delta // 7}周前"
         lines.append(f"- [{t}] {m.message}")
     return "## 最近印象\n" + "\n".join(lines)
 
@@ -132,8 +133,7 @@ def build_system_prompt(
     """返回 (stable, dynamic) 两段 system prompt。
     stable 部分不变可缓存，dynamic 部分每次不同不缓存。
     """
-    import datetime
-    now = datetime.datetime.now()
+    now = dt.now()
 
     # ── 动态部分 ──
     dynamic_parts = [

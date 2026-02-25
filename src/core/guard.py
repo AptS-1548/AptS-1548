@@ -1,3 +1,4 @@
+import datetime
 import hashlib
 import time
 from collections import OrderedDict, defaultdict
@@ -22,7 +23,7 @@ class Guard:
 
         self._user_hits: dict[str, list[float]] = defaultdict(list)
         self._daily_count = 0
-        self._day_start = time.time()
+        self._today = datetime.date.today()
         self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
     # ── 速率 ──
@@ -30,10 +31,11 @@ class Guard:
     def check_rate(self, user_id: str, is_owner: bool = False) -> tuple[bool, str]:
         now = time.time()
 
-        # 日预算重置
-        if now - self._day_start > 86400:
+        # 日预算重置（按自然日，非 24h 滚动）
+        today = datetime.date.today()
+        if today != self._today:
             self._daily_count = 0
-            self._day_start = now
+            self._today = today
 
         if self._daily_count >= self._daily_max:
             logger.warning(f"日预算耗尽 ({self._daily_count}/{self._daily_max})")

@@ -87,7 +87,7 @@ DEBOUNCE_SEC = 1.5
 BURST_COOLDOWN_SEC = 3.0  # 被取消后的冷静期，等用户说完
 
 
-def _update_attention(group_id: str, event: GroupMessageEvent) -> float:
+def _update_attention(group_id: str, event: GroupMessageEvent, bot_id: str) -> float:
     now = time.time()
     att = _group_attention[group_id]
 
@@ -108,7 +108,7 @@ def _update_attention(group_id: str, event: GroupMessageEvent) -> float:
     user_id = str(event.user_id)
     if user_id == plugin_config.owner_id:
         att += ATTENTION_OWNER
-    if _is_reply_to_me(event):
+    if _is_reply_to_me(event, bot_id):
         att += ATTENTION_QUOTED
 
     last_reply = _group_last_reply_time.get(group_id, 0)
@@ -121,11 +121,15 @@ def _update_attention(group_id: str, event: GroupMessageEvent) -> float:
     return att
 
 
-def _is_reply_to_me(event: GroupMessageEvent) -> bool:
+def _is_reply_to_me(event: GroupMessageEvent, bot_id: str) -> bool:
+    """判断消息是否引用了 bot 发的消息（通过 reply 段的 sender_id）"""
     try:
         for seg in event.message:
             if seg.type == "reply":
-                return True
+                # reply 段的 data["id"] 是消息 ID，sender_id 是原消息发送者
+                sender_id = str(seg.data.get("sender_id", ""))
+                if sender_id == bot_id:
+                    return True
     except Exception:
         pass
     return False
@@ -244,7 +248,10 @@ async def _evaluate_and_store(
     importance, impression = await evaluate_exchange(user_name, message, response)
 
     impression_key = f"{chat_type}_{chat_id}_{user_id}"
-    cooldown_ok = time.time() - _impression_last_stored.get(impression_key, 0) >= IMPRESSION_COOLDOWN_SEC
+    cooldown_ok = (
+        importance >= 0.8  # 高重要性无视冷却
+        or time.time() - _impression_last_stored.get(impression_key, 0) >= IMPRESSION_COOLDOWN_SEC
+    )
     should_store_impression = impression and importance >= 0.4 and cooldown_ok
 
     logger.debug(f"评估 | user={user_name} importance={importance:.2f} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
@@ -316,6 +323,16 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
             memory.get_impressions(user_id=user_id, limit=3),
         )
     logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)}")
+
+    # fallback: 短消息向量搜索无结果时，用最近几条兜底
+    if not memories:
+        fallback = await (
+            memory.recent(chat_id=chat_id, limit=3) if is_group
+            else memory.recent(user_id=user_id, limit=3)
+        )
+        if fallback:
+            memories = fallback
+            logger.debug(f"[{_tid()}] 记忆 fallback | 向量无结果，取最近 {len(fallback)} 条")
     memory_context = format_memories(memories)
     impression_context = format_impressions(impressions)
     if memory_context:
@@ -334,8 +351,8 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     if is_group:
         messages = build_group_turns(context=list(_group_context[group_id]), bot_name=plugin_config.bot_name)
     else:
+        _push_private(user_id, "user", text)
         messages = list(_private_histories[user_id])
-        messages.append({"role": "user", "content": text})
 
     logger.info(f"[{_tid()}] LLM → | user={user_id} msgs={len(messages)} group={is_group}")
     t0 = time.time()
@@ -355,7 +372,6 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         _group_last_reply_time[group_id] = time.time()
         _group_attention[group_id] = min(_group_attention[group_id] + ATTENTION_REPLY_BOOST, 1.0)
     else:
-        _push_private(user_id, "user", text)
         _push_private(user_id, "assistant", response)
 
     guard.record(user_id, text, response)
@@ -408,7 +424,7 @@ async def handle(bot: Bot, event: MessageEvent):
         _group_msg_times[group_id].append(time.time())
 
         is_at = event.is_tome()
-        att = _update_attention(group_id, event)
+        att = _update_attention(group_id, event, bot.self_id)
 
         if not is_at:
             att *= _density_multiplier(group_id)

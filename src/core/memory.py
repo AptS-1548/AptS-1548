@@ -248,23 +248,27 @@ class Memory:
         return entries[:limit]
 
 
+def _time_label(timestamp: float) -> str:
+    """时间戳 → 可读标签，按本地自然日计算"""
+    from datetime import datetime
+    delta = (datetime.now().date() - datetime.fromtimestamp(timestamp).date()).days
+    if delta == 0:
+        return "今天"
+    if delta == 1:
+        return "昨天"
+    if delta < 7:
+        return f"{delta}天前"
+    return f"{delta // 7}周前"
+
+
 def format_memories(memories: list[MemoryEntry]) -> str:
     """将记忆列表格式化为可注入 system prompt 的文本"""
     if not memories:
         return ""
 
-    now = time.time()
     lines = []
     for m in memories:
-        days = (now - m.timestamp) / 86400
-        if days < 1:
-            t = "今天"
-        elif days < 2:
-            t = "昨天"
-        elif days < 7:
-            t = f"{int(days)}天前"
-        else:
-            t = f"{int(days / 7)}周前"
+        t = _time_label(m.timestamp)
         msg = m.message[:60].replace("\n", " ")
         resp = m.response[:60].replace("\n", " ")
         where = f"群{m.chat_id}" if m.chat_type == "group" else "私聊"
