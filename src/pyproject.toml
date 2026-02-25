@@ -1,0 +1,23 @@
+[project]
+name = "apts-1548"
+version = "0.1.0"
+description = "AptS:1548 - 不是机器人，是人"
+requires-python = ">=3.10"
+dependencies = [
+    "nonebot2[fastapi]>=2.4.4",
+    "nonebot-adapter-onebot>=2.4.0",
+    "anthropic>=0.40.0",
+    "qdrant-client>=1.7.0",
+    "sentence-transformers>=3.0.0",
+]
+
+[tool.nonebot]
+plugin_dirs = ["plugins"]
+builtin_plugins = []
+
+[tool.nonebot.plugins]
+"@local" = []
+
+
+[tool.nonebot.adapters]
+"@local" = []
