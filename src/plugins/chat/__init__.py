@@ -19,6 +19,8 @@ from core.prompt import build_system_prompt, build_group_turns, format_impressio
 from core.guard import Guard
 from core.memory import Memory, MemoryEntry, format_memories
 from core.eval import evaluate_exchange
+from core.relationship import RelationshipManager
+from core.summarize import generate_user_summary
 
 from .config import Config
 
@@ -37,6 +39,7 @@ guard = Guard(
 )
 
 memory = Memory(qdrant_url=plugin_config.qdrant_url)
+relationship = RelationshipManager()
 
 # ── 私聊：多轮对话历史 ──
 _private_histories: dict[str, list[dict]] = defaultdict(list)
@@ -69,9 +72,8 @@ _pending: dict[str, asyncio.Task] = {}
 _burst_active: set[str] = set()  # 被取消过、正在冷静的会话
 _rebuilt_private_users: set[str] = set()  # 已重建过私聊历史的用户
 
-# ── 印象去重：同一用户/群 2 小时内只存一次印象 ──
+# ── 印象去重：同一用户/群 2 小时内只存一次印象（运行时 + 持久化通过 relationship）──
 IMPRESSION_COOLDOWN_SEC = 2 * 3600
-_impression_last_stored: dict[str, float] = {}
 
 # ── Trace ID（每次 LLM 调用一个，贯穿整条链路）──
 _trace_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
@@ -240,21 +242,66 @@ async def _typing_delay(text: str):
     await asyncio.sleep(delay)
 
 
+async def _update_user_summary(user_id: str, user_name: str):
+    """异步生成并更新用户摘要（在 _evaluate_and_store 的 task 里调用）"""
+    try:
+        impressions = await memory.get_impressions(user_id=user_id, recent_limit=5, key_limit=10)
+        p = relationship.get(user_id)
+        summary = await generate_user_summary(
+            user_name=user_name,
+            impressions=impressions,
+            trust=p.trust,
+            interaction_count=p.interaction_count,
+        )
+        if summary:
+            relationship.update_summary(user_id, summary)
+            logger.info(f"摘要更新 | user={user_name}: {summary!r}")
+    except Exception as e:
+        logger.warning(f"摘要更新失败 | user={user_id} {e}")
+
+
 async def _evaluate_and_store(
     user_id: str, chat_type: str, chat_id: str,
     user_name: str, message: str, response: str,
 ):
     """评估对话重要性 + 生成印象，异步存入 Qdrant。"""
-    importance, impression = await evaluate_exchange(user_name, message, response)
+
+    # Fix 6: owner 跳过 eval，省一次 API 调用，直接存对话记录
+    if user_id == plugin_config.owner_id:
+        await memory.store(MemoryEntry(
+            user_id=user_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            user_name=user_name,
+            message=message,
+            response=response,
+            importance=0.5,
+            record_type="dialog",
+        ))
+        return
+
+    importance, impression, trust_delta, facts = await evaluate_exchange(user_name, message, response)
 
     impression_key = f"{chat_type}_{chat_id}_{user_id}"
+    # Fix 4: 用 relationship 持久化的时间戳，重启后冷却不丢失
     cooldown_ok = (
-        importance >= 0.8  # 高重要性无视冷却
-        or time.time() - _impression_last_stored.get(impression_key, 0) >= IMPRESSION_COOLDOWN_SEC
+        importance >= 0.8
+        or time.time() - relationship.get_impression_ts(impression_key) >= IMPRESSION_COOLDOWN_SEC
     )
     should_store_impression = impression and importance >= 0.4 and cooldown_ok
 
-    logger.debug(f"评估 | user={user_name} importance={importance:.2f} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
+    logger.debug(f"[{_tid()}] 评估 | user={user_name} importance={importance:.2f} trust_delta={trust_delta:+} facts={facts} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
+
+    relationship.record_interaction(user_id, user_name, importance, trust_delta)
+    if facts:
+        relationship.add_facts(user_id, facts)
+    p = relationship.get(user_id)
+    should_summarize = (
+        (p.interaction_count > 0 and p.interaction_count % 10 == 0)
+        or (not p.summary and p.interaction_count >= 5)
+        or abs(trust_delta) >= 3
+        or importance >= 0.8
+    )
 
     await memory.store(MemoryEntry(
         user_id=user_id,
@@ -268,7 +315,8 @@ async def _evaluate_and_store(
     ))
 
     if should_store_impression:
-        _impression_last_stored[impression_key] = time.time()
+        # Fix 4: 持久化时间戳
+        relationship.set_impression_ts(impression_key, time.time())
         await memory.store(MemoryEntry(
             user_id=user_id,
             chat_type=chat_type,
@@ -280,12 +328,17 @@ async def _evaluate_and_store(
             record_type="impression",
         ))
 
+    # Fix 3: 在 dialog + impression 都存完后才触发摘要，确保新印象已入库
+    if should_summarize:
+        logger.debug(f"[{_tid()}] 摘要触发 | user={user_name} count={p.interaction_count} trust_delta={trust_delta:+} importance={importance:.2f}")
+        asyncio.create_task(_update_user_summary(user_id, user_name))
+
 
 async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool):
     """调用 LLM 并发送回复"""
     allowed, reject_msg = guard.check_rate(user_id, is_owner=is_owner)
     if not allowed:
-        logger.warning(f"速率限制 | user={user_id} msg={reject_msg}")
+        logger.warning(f"[{_tid()}] 速率限制 | user={user_id} msg={reject_msg}")
         await _send(bot, is_group, group_id, user_id, reject_msg)
         return
 
@@ -306,21 +359,21 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
                 _push_private(user_id, "user", e.message)
                 _push_private(user_id, "assistant", e.response)
             if entries:
-                logger.info(f"重建私聊历史 | user={user_id} 载入 {len(entries)} 条")
+                logger.info(f"[{_tid()}] 重建私聊历史 | user={user_id} 载入 {len(entries)} 条")
         except Exception as ex:
-            logger.warning(f"重建私聊历史失败 | user={user_id} {ex}")
+            logger.warning(f"[{_tid()}] 重建私聊历史失败 | user={user_id} {ex}")
 
     # 检索相关历史记忆 + 最近印象
     # 群聊按群隔离，私聊按人检索（群聊+私聊全捞）
     if is_group:
         memories, impressions = await asyncio.gather(
             memory.search(query=text, chat_id=chat_id, limit=4),
-            memory.get_impressions(chat_id=chat_id, limit=3),
+            memory.get_impressions(chat_id=chat_id),
         )
     else:
         memories, impressions = await asyncio.gather(
             memory.search(query=text, user_id=user_id, limit=4),
-            memory.get_impressions(user_id=user_id, limit=3),
+            memory.get_impressions(user_id=user_id),
         )
     logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)}")
 
@@ -335,10 +388,13 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
             logger.debug(f"[{_tid()}] 记忆 fallback | 向量无结果，取最近 {len(fallback)} 条")
     memory_context = format_memories(memories)
     impression_context = format_impressions(impressions)
+    rel_level = relationship.trust_level(user_id, plugin_config.owner_id)
+    rel_context = relationship.format_context(user_id, user_name, plugin_config.owner_id)
+    logger.debug(f"[{_tid()}] 关系 | user={user_name} level={rel_level} trust={relationship.get(user_id).trust:.1f}")
     if memory_context:
-        logger.debug(f"注入记忆 |\n{memory_context}")
+        logger.debug(f"[{_tid()}] 注入记忆 |\n{memory_context}")
     if impression_context:
-        logger.debug(f"注入印象 |\n{impression_context}")
+        logger.debug(f"[{_tid()}] 注入印象 |\n{impression_context}")
 
     system, system_dynamic = build_system_prompt(
         user_id=user_id,
@@ -346,6 +402,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         is_group=is_group,
         memory_context=memory_context,
         impression_context=impression_context,
+        relationship_context=rel_context,
     )
 
     if is_group:
