@@ -19,3 +19,9 @@ class Config(BaseModel):
 
     # Qdrant 地址
     qdrant_url: str = "http://localhost:6333"
+
+    # 记忆检索数量
+    memory_search_limit: int = 4        # 相关记忆条数
+    diary_limit: int = 3                # 日记（我的近况）条数
+    impression_recent_limit: int = 3    # 近期印象条数
+    impression_key_limit: int = 2       # 关键印象条数

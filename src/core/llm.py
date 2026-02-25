@@ -74,11 +74,22 @@ async def chat(
     response = await client.messages.create(**kwargs)
 
     # thinking 模式下跳过 thinking block，取 text block
+    text = ""
     for block in response.content:
         if block.type == "text":
-            return block.text
+            text = block.text
+            break
+    else:
+        text = response.content[-1].text
 
-    return response.content[-1].text
+    # 过滤模型格式泄露（proxy 问题）
+    for prefix in ("Human:", "Assistant:", "H:", "A:"):
+        if text.startswith(prefix):
+            logger.warning(f"格式泄露 | 原始={text[:50]!r}")
+            text = text[len(prefix):].strip()
+            break
+
+    return text
 
 
 def _extract_json(text: str) -> dict | None:

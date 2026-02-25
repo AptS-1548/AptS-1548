@@ -44,7 +44,9 @@ relationship = RelationshipManager()
 
 # ── 私聊：多轮对话历史 ──
 _private_histories: dict[str, list[dict]] = defaultdict(list)
+_private_last_time: dict[str, float] = {}  # user_id -> 上次消息时间
 MAX_PRIVATE_HISTORY = 20
+TIME_GAP_THRESHOLD = 600  # 10分钟以上插入时间标记
 
 # ── 群聊：滚动上下文（记录谁说了什么） ──
 _group_context: dict[str, list[dict]] = defaultdict(list)
@@ -63,7 +65,7 @@ ATTENTION_OWNER = 0.2
 ATTENTION_REPLY_BOOST = 0.2
 ATTENTION_QUOTED = 0.5
 
-REPLY_COOLDOWN_SEC = 90   # 回复后沉默 90 秒（被@除外）
+REPLY_COOLDOWN_SEC = 30   # 回复后沉默 30 秒（被@除外）
 DENSITY_WINDOW_SEC = 20   # 密度检测窗口
 DENSITY_THRESHOLD = 6     # 20 秒内超过 6 条算太吵
 DENSITY_MULT_MIN = 0.2    # 再吵也最多压到 0.2 倍
@@ -215,9 +217,24 @@ def _get_sender_name(event: GroupMessageEvent) -> str:
     return sender.card or sender.nickname or str(event.user_id)
 
 
-def _push_private(user_id: str, role: str, content: str):
+def _push_private(user_id: str, role: str, content: str, ts: float = 0):
     if not content.strip():
         return
+    now = ts or time.time()
+    # 用户消息且间隔超过阈值，插入时间标记
+    if role == "user":
+        last = _private_last_time.get(user_id, 0)
+        gap = now - last if last else 0
+        if gap >= TIME_GAP_THRESHOLD:
+            dt_now = datetime.datetime.fromtimestamp(now)
+            time_str = dt_now.strftime("%-m月%-d日 %H:%M")
+            _private_histories[user_id].append(
+                {"role": "user", "content": f"[{time_str}]"}
+            )
+            _private_histories[user_id].append(
+                {"role": "assistant", "content": "（继续对话）"}
+            )
+    _private_last_time[user_id] = now
     _private_histories[user_id].append({"role": role, "content": content})
     if len(_private_histories[user_id]) > MAX_PRIVATE_HISTORY:
         _private_histories[user_id] = _private_histories[user_id][-MAX_PRIVATE_HISTORY:]
@@ -463,8 +480,8 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         try:
             entries = await memory.recent(user_id=user_id, limit=MAX_PRIVATE_HISTORY // 2)
             for e in entries:
-                _push_private(user_id, "user", e.message)
-                _push_private(user_id, "assistant", e.response)
+                _push_private(user_id, "user", e.message, ts=e.timestamp)
+                _push_private(user_id, "assistant", e.response, ts=e.timestamp)
             if entries:
                 logger.info(f"[{_tid()}] 重建私聊历史 | user={user_id} 载入 {len(entries)} 条")
         except Exception as ex:
@@ -474,15 +491,15 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     # 群聊按群隔离，私聊按人检索（群聊+私聊全捞）
     if is_group:
         memories, impressions, diary_entries = await asyncio.gather(
-            memory.search(query=search_query, chat_id=chat_id, limit=4),
-            memory.get_impressions(chat_id=chat_id),
-            memory.get_diary(query=search_query),
+            memory.search(query=search_query, chat_id=chat_id, limit=plugin_config.memory_search_limit),
+            memory.get_impressions(chat_id=chat_id, recent_limit=plugin_config.impression_recent_limit, key_limit=plugin_config.impression_key_limit),
+            memory.get_diary(query=search_query, recent_limit=plugin_config.diary_limit),
         )
     else:
         memories, impressions, diary_entries = await asyncio.gather(
-            memory.search(query=search_query, user_id=user_id, limit=4),
-            memory.get_impressions(user_id=user_id),
-            memory.get_diary(query=search_query),
+            memory.search(query=search_query, user_id=user_id, limit=plugin_config.memory_search_limit),
+            memory.get_impressions(user_id=user_id, recent_limit=plugin_config.impression_recent_limit, key_limit=plugin_config.impression_key_limit),
+            memory.get_diary(query=search_query, recent_limit=plugin_config.diary_limit),
         )
     logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)} diary={len(diary_entries)}")
 
