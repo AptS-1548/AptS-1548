@@ -15,9 +15,10 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from core.llm import chat
-from core.prompt import build_system_prompt, build_group_turns
+from core.prompt import build_system_prompt, build_group_turns, format_impressions
 from core.guard import Guard
 from core.memory import Memory, MemoryEntry, format_memories
+from core.eval import evaluate_exchange
 
 from .config import Config
 
@@ -67,6 +68,10 @@ DENSITY_MULT_MIN = 0.2    # 再吵也最多压到 0.2 倍
 _pending: dict[str, asyncio.Task] = {}
 _burst_active: set[str] = set()  # 被取消过、正在冷静的会话
 _rebuilt_private_users: set[str] = set()  # 已重建过私聊历史的用户
+
+# ── 印象去重：同一用户/群 2 小时内只存一次印象 ──
+IMPRESSION_COOLDOWN_SEC = 2 * 3600
+_impression_last_stored: dict[str, float] = {}
 
 # ── Trace ID（每次 LLM 调用一个，贯穿整条链路）──
 _trace_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
@@ -183,7 +188,7 @@ async def _rebuild_context():
             entries = await memory.recent(chat_id=group_id, limit=MAX_GROUP_CONTEXT // 2)
             for e in entries:
                 _push_group(group_id, e.user_name, e.message)
-                _push_group(group_id, "48", e.response)
+                _push_group(group_id, plugin_config.bot_name, e.response)
             if entries:
                 logger.info(f"重建上下文 | 群 {group_id} 载入 {len(entries)} 条")
         except Exception as ex:
@@ -196,12 +201,16 @@ def _get_sender_name(event: GroupMessageEvent) -> str:
 
 
 def _push_private(user_id: str, role: str, content: str):
+    if not content.strip():
+        return
     _private_histories[user_id].append({"role": role, "content": content})
     if len(_private_histories[user_id]) > MAX_PRIVATE_HISTORY:
         _private_histories[user_id] = _private_histories[user_id][-MAX_PRIVATE_HISTORY:]
 
 
 def _push_group(group_id: str, name: str, content: str):
+    if not content.strip():
+        return
     _group_context[group_id].append({"name": name, "content": content})
     if len(_group_context[group_id]) > MAX_GROUP_CONTEXT:
         _group_context[group_id] = _group_context[group_id][-MAX_GROUP_CONTEXT:]
@@ -225,6 +234,44 @@ async def _typing_delay(text: str):
     if random.random() < 0.2:
         delay += random.uniform(1.5, 4.0)
     await asyncio.sleep(delay)
+
+
+async def _evaluate_and_store(
+    user_id: str, chat_type: str, chat_id: str,
+    user_name: str, message: str, response: str,
+):
+    """评估对话重要性 + 生成印象，异步存入 Qdrant。"""
+    importance, impression = await evaluate_exchange(user_name, message, response)
+
+    impression_key = f"{chat_type}_{chat_id}_{user_id}"
+    cooldown_ok = time.time() - _impression_last_stored.get(impression_key, 0) >= IMPRESSION_COOLDOWN_SEC
+    should_store_impression = impression and importance >= 0.4 and cooldown_ok
+
+    logger.debug(f"评估 | user={user_name} importance={importance:.2f} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
+
+    await memory.store(MemoryEntry(
+        user_id=user_id,
+        chat_type=chat_type,
+        chat_id=chat_id,
+        user_name=user_name,
+        message=message,
+        response=response,
+        importance=importance,
+        record_type="dialog",
+    ))
+
+    if should_store_impression:
+        _impression_last_stored[impression_key] = time.time()
+        await memory.store(MemoryEntry(
+            user_id=user_id,
+            chat_type=chat_type,
+            chat_id=chat_id,
+            user_name=user_name,
+            message=impression,
+            response="",
+            importance=importance,
+            record_type="impression",
+        ))
 
 
 async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool):
@@ -256,22 +303,32 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         except Exception as ex:
             logger.warning(f"重建私聊历史失败 | user={user_id} {ex}")
 
-    # 检索相关历史记忆
+    # 检索相关历史记忆 + 最近印象
     # 群聊按群隔离，私聊按人检索（群聊+私聊全捞）
     if is_group:
-        memories = await memory.search(query=text, chat_id=chat_id, limit=4)
+        memories, impressions = await asyncio.gather(
+            memory.search(query=text, chat_id=chat_id, limit=4),
+            memory.get_impressions(chat_id=chat_id, limit=3),
+        )
     else:
-        memories = await memory.search(query=text, user_id=user_id, limit=4)
-    logger.info(f"[{_tid()}] 记忆检索 | {len(memories)} 条 chat_id={chat_id}")
+        memories, impressions = await asyncio.gather(
+            memory.search(query=text, user_id=user_id, limit=4),
+            memory.get_impressions(user_id=user_id, limit=3),
+        )
+    logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)}")
     memory_context = format_memories(memories)
+    impression_context = format_impressions(impressions)
     if memory_context:
         logger.debug(f"注入记忆 |\n{memory_context}")
+    if impression_context:
+        logger.debug(f"注入印象 |\n{impression_context}")
 
     system, system_dynamic = build_system_prompt(
         user_id=user_id,
         owner_id=plugin_config.owner_id,
         is_group=is_group,
         memory_context=memory_context,
+        impression_context=impression_context,
     )
 
     if is_group:
@@ -303,15 +360,15 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
 
     guard.record(user_id, text, response)
 
-    # 异步存入长期记忆，不阻塞发消息
-    asyncio.create_task(memory.store(MemoryEntry(
+    # 异步评估 + 存入长期记忆，不阻塞发消息
+    asyncio.create_task(_evaluate_and_store(
         user_id=user_id,
         chat_type="group" if is_group else "private",
         chat_id=chat_id,
         user_name=user_name,
         message=text,
         response=response,
-    )))
+    ))
 
     lines = [line.strip() for line in response.split("\n") if line.strip()]
     if not lines:

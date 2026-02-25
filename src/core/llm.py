@@ -33,10 +33,12 @@ async def chat(
     messages: list[dict],
     model: str | None = None,
     system_dynamic: str = "",
+    max_tokens: int | None = None,
+    disable_thinking: bool = False,
 ) -> str:
     env = get_driver().config
     model = model or getattr(env, "claude_model", "claude-opus-4-6")
-    max_tokens = int(getattr(env, "max_tokens", 16384))
+    max_tokens = max_tokens or int(getattr(env, "max_tokens", 16384))
 
     client = _get_client()
 
@@ -64,7 +66,7 @@ async def chat(
     }
 
     # thinking
-    thinking = _build_thinking(env)
+    thinking = None if disable_thinking else _build_thinking(env)
     if thinking:
         kwargs["thinking"] = thinking
         kwargs["temperature"] = 1  # thinking 模式必须 temperature=1

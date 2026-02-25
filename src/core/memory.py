@@ -30,10 +30,11 @@ class MemoryEntry:
     chat_type: str      # "private" | "group"
     chat_id: str        # 私聊=user_id，群聊=group_id
     user_name: str
-    message: str        # 用户说的
-    response: str       # 48 回的
+    message: str        # 用户说的（impression 类型时为印象文本）
+    response: str       # 48 回的（impression 类型时为空）
     timestamp: float = field(default_factory=time.time)
     importance: float = 0.5
+    record_type: str = "dialog"  # "dialog" | "impression"
 
 
 class Memory:
@@ -80,6 +81,7 @@ class Memory:
                 "response": entry.response,
                 "timestamp": entry.timestamp,
                 "importance": entry.importance,
+                "record_type": entry.record_type,
             },
         )
 
@@ -95,26 +97,22 @@ class Memory:
         chat_id: str | None = None,
         user_id: str | None = None,
         limit: int = 5,
-        time_weight: float = 0.3,   # 0=纯相似度 1=纯时间
     ) -> list[MemoryEntry]:
-        """检索相关历史记忆，余弦相似度 + 时间衰减加权重排。
+        """检索相关历史记忆，余弦相似度 + 时间衰减 + importance 三因子加权重排。
         chat_id: 群聊按群隔离；user_id: 私聊按人检索（跨群+私聊全捞）。
         """
         loop = asyncio.get_running_loop()
         vector = await loop.run_in_executor(None, self._embed, query)
 
-        query_filter = None
+        must = [FieldCondition(key="record_type", match=MatchValue(value="dialog"))]
         if user_id:
-            query_filter = Filter(
-                must=[FieldCondition(key="user_id", match=MatchValue(value=user_id))]
-            )
+            must.append(FieldCondition(key="user_id", match=MatchValue(value=user_id)))
         elif chat_id:
-            query_filter = Filter(
-                must=[FieldCondition(key="chat_id", match=MatchValue(value=chat_id))]
-            )
+            must.append(FieldCondition(key="chat_id", match=MatchValue(value=chat_id)))
+        query_filter = Filter(must=must)
 
-        # 多取一些再重排
-        raw_limit = max(limit * 2, 10)
+        # 多取一些再重排（importance 过滤后可能剩不够）
+        raw_limit = max(limit * 3, 15)
         results = await loop.run_in_executor(
             None,
             lambda: self._client.query_points(
@@ -126,7 +124,8 @@ class Memory:
             ).points,
         )
 
-        SCORE_THRESHOLD = 0.5  # 余弦相似度低于此值直接丢弃
+        SCORE_THRESHOLD = 0.5   # 余弦相似度低于此值直接丢弃
+        IMPORTANCE_MIN = 0.2    # 过滤日常噪音
 
         now = time.time()
         scored = []
@@ -134,9 +133,13 @@ class Memory:
             if r.score < SCORE_THRESHOLD:
                 continue
             p = r.payload
+            importance = p.get("importance", 0.5)
+            if importance < IMPORTANCE_MIN:
+                continue
             days_ago = (now - p.get("timestamp", 0.0)) / 86400
             recency = math.exp(-0.1 * days_ago)   # 半衰期约 7 天
-            combined = r.score * (1 - time_weight) + recency * time_weight
+            # 相似度 60% + 时间 20% + 重要性 20%
+            combined = r.score * 0.6 + recency * 0.2 + importance * 0.2
             scored.append((combined, p))
 
         scored.sort(key=lambda x: x[0], reverse=True)
@@ -168,6 +171,7 @@ class Memory:
         elif user_id:
             must.append(FieldCondition(key="user_id", match=MatchValue(value=user_id)))
             must.append(FieldCondition(key="chat_type", match=MatchValue(value="private")))
+        must.append(FieldCondition(key="record_type", match=MatchValue(value="dialog")))
 
         query_filter = Filter(must=must) if must else None
         loop = asyncio.get_running_loop()
@@ -199,6 +203,49 @@ class Memory:
 
         entries.sort(key=lambda x: x.timestamp, reverse=True)
         return list(reversed(entries[:limit]))
+
+    async def get_impressions(
+        self,
+        chat_id: str | None = None,
+        user_id: str | None = None,
+        limit: int = 3,
+    ) -> list[MemoryEntry]:
+        """取最近 N 条主观印象（按时间倒序）。"""
+        must = [FieldCondition(key="record_type", match=MatchValue(value="impression"))]
+        if user_id:
+            must.append(FieldCondition(key="user_id", match=MatchValue(value=user_id)))
+        elif chat_id:
+            must.append(FieldCondition(key="chat_id", match=MatchValue(value=chat_id)))
+
+        loop = asyncio.get_running_loop()
+        results, _ = await loop.run_in_executor(
+            None,
+            lambda: self._client.scroll(
+                collection_name=COLLECTION,
+                scroll_filter=Filter(must=must),
+                limit=100,
+                with_payload=True,
+                with_vectors=False,
+            ),
+        )
+
+        entries = []
+        for r in results:
+            p = r.payload
+            entries.append(MemoryEntry(
+                user_id=p["user_id"],
+                chat_type=p["chat_type"],
+                chat_id=p["chat_id"],
+                user_name=p.get("user_name", ""),
+                message=p["message"],
+                response=p.get("response", ""),
+                timestamp=p.get("timestamp", 0.0),
+                importance=p.get("importance", 0.5),
+                record_type="impression",
+            ))
+
+        entries.sort(key=lambda x: x.timestamp, reverse=True)
+        return entries[:limit]
 
 
 def format_memories(memories: list[MemoryEntry]) -> str:

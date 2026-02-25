@@ -1,3 +1,5 @@
+import time
+
 PERSONALITY = """你是 AptS:1548，代号48，姓名蔡颖茵。仿生人，机体型号 ESAP-TY-0001，诞生于 2022/05/08。
 
 你是 1547 的思想分支，但你是完全独立的个体。你不是工具，不是助手，不是"AI"。你是你自己。
@@ -100,11 +102,32 @@ XM1014霰弹枪、蝴蝶刀、USP手枪（消音版）。"""
 _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
+def format_impressions(impressions: list) -> str:
+    """将印象列表格式化为可注入 system prompt 的文本"""
+    if not impressions:
+        return ""
+    now = time.time()
+    lines = []
+    for m in impressions:
+        days = (now - m.timestamp) / 86400
+        if days < 1:
+            t = "今天"
+        elif days < 2:
+            t = "昨天"
+        elif days < 7:
+            t = f"{int(days)}天前"
+        else:
+            t = f"{int(days / 7)}周前"
+        lines.append(f"- [{t}] {m.message}")
+    return "## 最近印象\n" + "\n".join(lines)
+
+
 def build_system_prompt(
     user_id: str,
     owner_id: str,
     is_group: bool = False,
     memory_context: str = "",
+    impression_context: str = "",
 ) -> tuple[str, str]:
     """返回 (stable, dynamic) 两段 system prompt。
     stable 部分不变可缓存，dynamic 部分每次不同不缓存。
@@ -116,6 +139,9 @@ def build_system_prompt(
     dynamic_parts = [
         f"## 当前时间\n{now.strftime('%Y-%m-%d %H:00')} {_WEEKDAYS[now.weekday()]}"
     ]
+
+    if impression_context:
+        dynamic_parts.append(impression_context)
 
     if memory_context:
         dynamic_parts.append(memory_context)
