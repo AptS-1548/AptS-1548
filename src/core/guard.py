@@ -66,9 +66,21 @@ class Guard:
             return None
         return resp
 
+    def _cleanup_hits(self):
+        """清理所有用户已过期的 hit 记录，防止长期运行内存增长。"""
+        now = time.time()
+        stale = [uid for uid, hits in self._user_hits.items()
+                 if not any(now - t < 60 for t in hits)]
+        for uid in stale:
+            del self._user_hits[uid]
+        if stale:
+            logger.debug(f"速率 | 清理 {len(stale)} 个闲置用户 hit 记录")
+
     def record(self, user_id: str, message: str, response: str):
         self._user_hits[user_id].append(time.time())
         self._daily_count += 1
+        if self._daily_count % 100 == 0:
+            self._cleanup_hits()
 
         key = self._make_key(user_id, message)
         if key in self._cache:
