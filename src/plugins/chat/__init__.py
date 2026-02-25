@@ -185,6 +185,7 @@ driver = get_driver()
 async def _startup():
     asyncio.create_task(_attention_decay_loop())
     asyncio.create_task(_rebuild_context())
+    asyncio.create_task(memory.cleanup_old_entries())  # Fix 7: 启动时异步清理旧低价值记忆
 
 
 async def _rebuild_context():
@@ -303,7 +304,8 @@ async def _evaluate_and_store(
         or importance >= 0.8
     )
 
-    await memory.store(MemoryEntry(
+    # Fix 2: dialog + impression 合并为一次 store_batch，减少 Qdrant IO
+    entries_to_store = [MemoryEntry(
         user_id=user_id,
         chat_type=chat_type,
         chat_id=chat_id,
@@ -312,12 +314,11 @@ async def _evaluate_and_store(
         response=response,
         importance=importance,
         record_type="dialog",
-    ))
+    )]
 
     if should_store_impression:
-        # Fix 4: 持久化时间戳
         relationship.set_impression_ts(impression_key, time.time())
-        await memory.store(MemoryEntry(
+        entries_to_store.append(MemoryEntry(
             user_id=user_id,
             chat_type=chat_type,
             chat_id=chat_id,
@@ -327,6 +328,8 @@ async def _evaluate_and_store(
             importance=importance,
             record_type="impression",
         ))
+
+    await memory.store_batch(entries_to_store)
 
     # Fix 3: 在 dialog + impression 都存完后才触发摘要，确保新印象已入库
     if should_summarize:
