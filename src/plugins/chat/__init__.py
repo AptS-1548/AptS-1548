@@ -713,6 +713,12 @@ async def _flush_eval(user_id: str):
         context=eval_context,
     )
 
+    # 短对话跳过：塞回 buffer，等下次有新消息时一起评估
+    if not ev.impression and ev.importance <= 0.2 and ev.trust_delta == 0:
+        _eval_buffer[user_id] = rounds_info + _eval_buffer.get(user_id, [])
+        logger.debug(f"eval flush | user={user_name} 短对话，{len(rounds_info)}轮塞回 buffer")
+        return
+
     # 新待办写入 + 解析 target
     if ev.tasks:
         for t in ev.tasks:
