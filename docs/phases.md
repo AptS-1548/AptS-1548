@@ -90,7 +90,7 @@ Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替�
 **对话评估（`core/eval.py`）**
 - 每次对话结束后异步 LLM 调用（不阻塞发消息）
 - batch eval：攒 3 轮或超时 120s 批量评估，dialog 立即存储（默认 importance=0.5）
-- 单次调用返回八个字段：
+- 单次调用返回 `EvalResult` 结构体，包含八个字段：
   - `importance`（0.0~1.0）：对话重要性
   - `impression`（≤50字）：48 视角的主观印象
   - `trust_delta`（-5~+5 整数）：对这次互动的信任评估
@@ -163,7 +163,7 @@ facts,     # 从对话提取的事实列表
 
 ---
 
-## Phase 5: 主动行为 🚧
+## Phase 5: 主动行为 ✅
 
 ### 目标
 
@@ -481,6 +481,42 @@ task:ulid
 - `[不回复]` 扩展到群聊：prompt 和代码两侧都支持
 - thinking 泄露过滤：`core/llm.py` 自动剥除 `<thinking>` 块
 - 发送完成日志：`发送完成 | user=xxx lines=N`
+
+---
+
+### 5.9 架构审计修复 ✅
+
+**Phase 5 完成后的全面审计，修复 12 项问题。**
+
+**Bug 修复**
+- `_write_diary_entry` 中 `get_diary(limit=3)` → `get_diary(recent_limit=3)`（参数名错误，被 bare except 掩盖）
+
+**数据安全**
+- `relationship.py`: `_save()` / `_save_impression_ts()` 改为原子写入（write-to-tmp + `os.replace()`）
+- `schedule.py`: 日程缓存 `data/schedule.json` 也用原子写入
+- `graph.py`: SurrealDB 凭证从 config 传入，不再硬编码 root/root
+
+**可靠性**
+- `llm.py`: 所有 API 调用包裹 `asyncio.wait_for(timeout=120s)`
+- `graph.py`: 新增 `_reconnect()` + `_query()` 包装，连接断开自动重连重试
+- `schedule.py`: 日程存入磁盘缓存，重启不再调 LLM
+
+**生命周期**
+- `__init__.py`: 新增 `_shutdown()` handler — flush eval buffer、关闭 SurrealDB、cancel 后台 tasks
+- `__init__.py`: 后台任务统一追踪到 `_background_tasks` 列表
+
+**可观测性**
+- `llm.py`: 新增 `set_api_call_hook()` + `_notify_api_call()` hook 机制
+- `guard.py`: 新增 `record_api_call()` + `api_calls_today` 属性，统计实际 API 调用次数
+- `__init__.py`: 全部 ~8 处 bare `except Exception: pass` 替换为 `except Exception as e: logger.warning/debug(...)`
+
+**代码质量**
+- `eval.py`: `evaluate_batch()` 返回值从 8-tuple 改为 `EvalResult` dataclass
+- `memory.py`: `_time_label()` 改为公开 `time_label()`，消除 prompt.py 中的重复实现
+- `story.py`: 自创故事存储前检查 `memory.is_story_duplicate()` 防重复
+
+**未做**
+- `__init__.py` 拆分为多模块（影响太大，留到 Phase 6 前再做）
 
 ---
 

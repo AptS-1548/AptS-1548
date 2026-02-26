@@ -7,7 +7,7 @@ from nonebot import logger
 
 
 class Guard:
-    """速率限制 + 日预算 + 重复消息缓存"""
+    """速率限制 + 日预算 + 重复消息缓存 + API 调用计数"""
 
     def __init__(
         self,
@@ -23,19 +23,28 @@ class Guard:
 
         self._user_hits: dict[str, list[float]] = defaultdict(list)
         self._daily_count = 0
+        self._api_calls_today = 0  # 实际 LLM API 调用次数
         self._today = datetime.date.today()
         self._cache: OrderedDict[str, tuple[str, float]] = OrderedDict()
 
     # ── 速率 ──
 
-    def check_rate(self, user_id: str, is_owner: bool = False) -> tuple[bool, str]:
-        now = time.time()
+    def record_api_call(self):
+        """记录一次实际的 LLM API 调用。供 llm.py 调用。"""
+        self._ensure_date()
+        self._api_calls_today += 1
 
-        # 日预算重置（按自然日，非 24h 滚动）
+    def _ensure_date(self):
+        """日预算重置（按自然日）。"""
         today = datetime.date.today()
         if today != self._today:
             self._daily_count = 0
+            self._api_calls_today = 0
             self._today = today
+
+    def check_rate(self, user_id: str, is_owner: bool = False) -> tuple[bool, str]:
+        now = time.time()
+        self._ensure_date()
 
         if self._daily_count >= self._daily_max:
             logger.warning(f"日预算耗尽 ({self._daily_count}/{self._daily_max})")
@@ -92,6 +101,12 @@ class Guard:
     @property
     def daily_usage(self) -> tuple[int, int]:
         return self._daily_count, self._daily_max
+
+    @property
+    def api_calls_today(self) -> int:
+        """今天实际的 LLM API 调用次数。"""
+        self._ensure_date()
+        return self._api_calls_today
 
     @staticmethod
     def _make_key(user_id: str, message: str) -> str:

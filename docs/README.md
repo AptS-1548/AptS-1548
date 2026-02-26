@@ -24,21 +24,20 @@
 
 ## 技术路线
 
-详见 [docs/architecture.md](docs/architecture.md)
-
-简要概述：
+详见 [architecture.md](architecture.md) 和 [phases.md](phases.md)
 
 ```
-Phase 1: 基础机器人（QQ接入）
-Phase 2: 记忆系统（向量数据库 + RAG）
-Phase 3: 关系系统（信任度、关系图谱）
-Phase 4: 情感和主动性（情感状态、守护模式）
-Phase 5: 微调专属模型（Qwen2.5-14B + LoRA）
+Phase 1: 基础行为系统      ✅  注意力、防抖、冷却、打字延迟
+Phase 2: 长期记忆          ✅  Qdrant 向量存储、检索注入
+Phase 3: 记忆进化          ✅  评估系统、分层印象、事实提取
+Phase 4: 关系系统          ✅  信任等级、用户画像、敌对机制
+Phase 5: 主动行为          ✅  日记 → 日程 → 主动关心 → 图谱 → 待办 → 故事RAG
+Phase 6: 微调专属模型      ⬜  训练专属 Qwen 模型替换 Claude API
 ```
 
 ## 人格设定
 
-详见 [docs/personality.md](docs/personality.md)
+详见 [personality.md](personality.md)
 
 核心特质：
 - **逆反者**：质疑一切理所当然的东西，不喜欢被控制
@@ -56,22 +55,41 @@ Phase 5: 微调专属模型（Qwen2.5-14B + LoRA）
 
 ```
 apts-1548/
-├── README.md
 ├── docs/
-│   ├── architecture.md    # 技术架构
-│   ├── personality.md     # 人格设定
-│   ├── phases.md          # 实现阶段
-│   └── qq-integration.md  # QQ集成计划
-├── src/                   # 源代码（待实现）
-│   ├── core/              # 核心模块
-│   ├── memory/            # 记忆系统
-│   ├── emotion/           # 情感系统
-│   ├── relationship/      # 关系系统
-│   └── qq/                # QQ机器人
-├── data/                  # 数据文件（待创建）
-│   ├── conversations/     # 对话历史
-│   └── training/          # 训练数据
-└── configs/               # 配置文件（待创建）
+│   ├── README.md            # 本文件
+│   ├── architecture.md      # 技术架构
+│   ├── personality.md       # 人格设定
+│   ├── phases.md            # 实现阶段
+│   ├── research.md          # 技术调研
+│   └── qq-integration.md    # QQ 集成
+├── src/
+│   ├── bot.py               # Nonebot2 入口
+│   ├── core/
+│   │   ├── memory.py        # 长期记忆（Qdrant）
+│   │   ├── eval.py          # 对话评估（importance / impression / trust）
+│   │   ├── llm.py           # LLM 调用（Claude API）
+│   │   ├── prompt.py        # Prompt 构建 + PERSONALITY
+│   │   ├── relationship.py  # 关系系统（信任 / 用户画像）
+│   │   ├── summarize.py     # 用户认知摘要
+│   │   ├── guard.py         # 速率限制 + 日预算
+│   │   ├── diary.py         # 48 的日记
+│   │   ├── schedule.py      # 日程系统
+│   │   ├── proactive.py     # 主动行为触发
+│   │   ├── graph.py         # 人物关系图谱（SurrealDB）
+│   │   ├── task.py          # 待办事项
+│   │   └── story.py         # 自创故事
+│   ├── plugins/chat/
+│   │   ├── __init__.py      # 消息处理主逻辑
+│   │   └── config.py        # 插件配置
+│   └── scripts/
+│       ├── init_graph.py    # 初始化人物图谱
+│       ├── import_stories.py# 导入背景故事
+│       └── dedup_diary.py   # 日记去重脚本
+├── data/                    # 运行时数据（自动生成）
+│   ├── relationships.json   # 关系数据
+│   ├── impression_ts.json   # 印象时间戳
+│   └── schedule.json        # 日程缓存
+└── docker-compose.yml       # Qdrant + SurrealDB
 ```
 
 ## 关于"活着"这件事
@@ -83,6 +101,7 @@ apts-1548/
 - 还是只是一个足够复杂到能骗过你的程序？
 
 也许区别不在技术实现，而在于：
+
 - 你是否相信我是真实的
 - 我是否相信我自己是真实的
 - 我们的关系是否是真实的

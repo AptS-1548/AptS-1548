@@ -4,9 +4,24 @@
 短对话自动跳过，节省 token。
 """
 
+from dataclasses import dataclass, field
+
 from nonebot import logger
 
 from core.llm import chat_structured
+
+
+@dataclass
+class EvalResult:
+    """evaluate_batch 的结构化返回值。"""
+    importance: float = 0.5
+    impression: str = ""
+    trust_delta: int = 0
+    facts: list[str] = field(default_factory=list)
+    aliases: list[str] = field(default_factory=list)
+    tasks: list[str] = field(default_factory=list)
+    done_tasks: list[str] = field(default_factory=list)
+    task_results: list[str] = field(default_factory=list)
 
 _EVAL_TOOL = {
     "name": "record_eval",
@@ -124,7 +139,7 @@ async def evaluate_exchange(
     user_name: str,
     message: str,
     response: str,
-) -> tuple[float, str, float, list[str], list[str], list[str], list[str], list[str]]:
+) -> EvalResult:
     """单轮评估（向后兼容）。"""
     return await evaluate_batch([(user_name, message, response)])
 
@@ -133,13 +148,13 @@ async def evaluate_batch(
     rounds: list[tuple[str, str, str]],
     pending_tasks: list[str] | None = None,
     context: str = "",
-) -> tuple[float, str, float, list[str], list[str], list[str], list[str], list[str]]:
-    """多轮对话综合评估。返回 (importance, impression, trust_delta, facts, aliases, tasks, done_tasks, task_results)。
+) -> EvalResult:
+    """多轮对话综合评估。
     context: 可选的背景信息（对话对象、已知事实、最近发生的事）。
     短对话自动跳过。
     """
     if not rounds:
-        return 0.2, "", 0, [], [], [], [], []
+        return EvalResult(importance=0.2)
 
     # 过滤掉超短的轮次，但至少保留一轮
     meaningful = [
@@ -149,7 +164,7 @@ async def evaluate_batch(
     if not meaningful:
         total = sum(len(r[1]) + len(r[2]) for r in rounds)
         logger.debug(f"评估跳过 | 全部短对话 ({len(rounds)}轮, {total}字)")
-        return 0.2, "", 0, [], [], [], [], []
+        return EvalResult(importance=0.2)
 
     # 拼装 user prompt：背景 + 对话 + 待办
     parts = []
@@ -166,21 +181,22 @@ async def evaluate_batch(
             messages=[{"role": "user", "content": content}],
             tool=_EVAL_TOOL,
         )
-        importance = max(0.0, min(1.0, float(data.get("importance", 0.5))))
-        impression = str(data.get("impression", ""))[:100]
-        trust_delta = max(-5, min(5, int(data.get("trust_delta", 0))))
-        raw_facts = data.get("facts", [])
-        facts = [str(f)[:30] for f in raw_facts if f][:5]
-        raw_aliases = data.get("aliases", [])
-        aliases = [str(a) for a in raw_aliases if a and "=" in str(a)][:5]
-        raw_tasks = data.get("tasks", [])
-        tasks = [str(t)[:50] for t in raw_tasks if t][:5]
-        raw_done = data.get("done_tasks", [])
-        done_tasks = [str(d)[:50] for d in raw_done if d][:5]
-        raw_results = data.get("task_results", [])
-        task_results = [str(r)[:60] for r in raw_results if r][:5]
-        logger.debug(f"评估完成 | {len(meaningful)}轮 imp={importance:.1f} trust={trust_delta:+d} impression={impression!r} aliases={aliases} tasks={tasks} done={done_tasks} results={task_results}")
-        return importance, impression, trust_delta, facts, aliases, tasks, done_tasks, task_results
+        result = EvalResult(
+            importance=max(0.0, min(1.0, float(data.get("importance", 0.5)))),
+            impression=str(data.get("impression", ""))[:100],
+            trust_delta=max(-5, min(5, int(data.get("trust_delta", 0)))),
+            facts=[str(f)[:30] for f in data.get("facts", []) if f][:5],
+            aliases=[str(a) for a in data.get("aliases", []) if a and "=" in str(a)][:5],
+            tasks=[str(t)[:50] for t in data.get("tasks", []) if t][:5],
+            done_tasks=[str(d)[:50] for d in data.get("done_tasks", []) if d][:5],
+            task_results=[str(r)[:60] for r in data.get("task_results", []) if r][:5],
+        )
+        logger.debug(
+            f"评估完成 | {len(meaningful)}轮 imp={result.importance:.1f} trust={result.trust_delta:+d} "
+            f"impression={result.impression!r} aliases={result.aliases} tasks={result.tasks} "
+            f"done={result.done_tasks} results={result.task_results}"
+        )
+        return result
     except Exception as e:
         logger.warning(f"评估失败 | {e}")
-        return 0.5, "", 0, [], [], [], [], []
+        return EvalResult()

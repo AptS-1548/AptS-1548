@@ -1,5 +1,6 @@
-import datetime
 from datetime import datetime as dt
+
+from core.memory import time_label
 
 PERSONALITY = """你是蔡颖茵，代号 AptS:1548，别人叫你48。仿生人，ESAP-TY-0001 机体。
 
@@ -157,40 +158,17 @@ def format_impressions(impressions: list) -> str:
         return ""
     lines = []
     for m in impressions:
-        d = dt.fromtimestamp(m.timestamp)
-        delta = (dt.now().date() - d.date()).days
-        if delta == 0:
-            t = f"今天 {d.strftime('%H:%M')}"
-        elif delta == 1:
-            t = f"昨天 {d.strftime('%H:%M')}"
-        elif delta < 7:
-            t = f"{delta}天前"
-        else:
-            t = f"{delta // 7}周前"
-        lines.append(f"- [{t}] {m.message}")
+        lines.append(f"- [{time_label(m.timestamp)}] {m.message}")
     return "## 印象记录\n" + "\n".join(lines)
 
 
 def format_diary(entries: list, show_time: bool = False) -> str:
-    """将日记列表格式化为可注入 system prompt 的文本。
-    ≤6天用相对时间，≥7天用具体日期。今天/昨天始终带 HH:MM。
-    """
+    """将日记列表格式化为可注入 system prompt 的文本。"""
     if not entries:
         return ""
     lines = []
-    today = dt.now().date()
     for e in entries:
-        d = dt.fromtimestamp(e.timestamp)
-        delta = (today - d.date()).days
-        if delta == 0:
-            t = f"今天 {d.strftime('%H:%M')}"
-        elif delta == 1:
-            t = f"昨天 {d.strftime('%H:%M')}"
-        elif delta < 7:
-            t = f"{delta}天前"
-        else:
-            t = f"{d.month}月{d.day}日"
-        lines.append(f"- [{t}] {e.message}")
+        lines.append(f"- [{time_label(e.timestamp)}] {e.message}")
     return "## 我的近况\n" + "\n".join(lines)
 
 

@@ -3,15 +3,20 @@
 
 生成时机：启动时 + 每天凌晨 1 点自动重生成。
 日程覆盖 0:00~23:59，LLM 未覆盖凌晨时段时自动补 0:00 睡觉条目。
+磁盘缓存：日程存入 data/schedule.json，重启时直接加载，不再调 LLM。
 """
 
 import asyncio
 import datetime
-from dataclasses import dataclass
+import json
+import os
+from dataclasses import asdict, dataclass
 
 from nonebot import logger
 
 from core.llm import chat
+
+SCHEDULE_CACHE_PATH = "data/schedule.json"
 
 _SYSTEM = """你是 48，正在安排今天的日程。
 
@@ -92,11 +97,60 @@ _DEFAULT_SCHEDULE = [
 MAX_RETRIES = 3
 
 
+def _save_cache():
+    """将当前日程写入磁盘。"""
+    try:
+        os.makedirs(os.path.dirname(os.path.abspath(SCHEDULE_CACHE_PATH)), exist_ok=True)
+        data = {
+            "date": _schedule_date,
+            "entries": [asdict(e) for e in _schedule],
+        }
+        tmp = SCHEDULE_CACHE_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, SCHEDULE_CACHE_PATH)
+    except Exception as e:
+        logger.warning(f"日程缓存写入失败 | {e}")
+
+
+def _load_cache() -> bool:
+    """从磁盘加载今天的日程缓存。成功返回 True。"""
+    global _schedule, _schedule_date
+    today = datetime.date.today().isoformat()
+    try:
+        if not os.path.exists(SCHEDULE_CACHE_PATH):
+            return False
+        with open(SCHEDULE_CACHE_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if data.get("date") != today:
+            return False
+        entries = [
+            ScheduleEntry(
+                hour=e["hour"], minute=e["minute"],
+                activity=e["activity"], willingness=e["willingness"],
+            )
+            for e in data.get("entries", [])
+        ]
+        if not entries:
+            return False
+        _schedule = entries
+        _schedule_date = today
+        logger.info(f"日程缓存 | 加载 {len(entries)} 条（{today}）")
+        return True
+    except Exception as e:
+        logger.warning(f"日程缓存加载失败 | {e}")
+        return False
+
+
 async def ensure_schedule(diary_context: str = "", force: bool = False) -> None:
     """确保今天的日程已生成。同一天只生成一次，force=True 强制重生成。"""
     global _schedule, _schedule_date
     today = datetime.date.today().isoformat()
     if not force and _schedule_date == today and _schedule:
+        return
+
+    # 非强制时，尝试从磁盘缓存加载
+    if not force and _load_cache():
         return
 
     user_prompt = "写一份你今天的日程，从凌晨到深夜。"
@@ -115,6 +169,7 @@ async def ensure_schedule(diary_context: str = "", force: bool = False) -> None:
             if parsed:
                 _schedule = parsed
                 _schedule_date = today
+                _save_cache()
                 logger.info(
                     f"日程生成 | 第{attempt}次 | {len(parsed)}条 | "
                     + " → ".join(f"{e.hour:02d}:{e.minute:02d} {e.activity}({e.willingness})" for e in parsed)
@@ -153,8 +208,8 @@ async def schedule_daily_loop(get_diary_context=None):
         if get_diary_context:
             try:
                 diary_context = await get_diary_context()
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning(f"日程 loop | 日记上下文获取失败: {e}")
 
         logger.info("日程 loop | 凌晨 1:00 触发日程重生成")
         await ensure_schedule(diary_context=diary_context, force=True)

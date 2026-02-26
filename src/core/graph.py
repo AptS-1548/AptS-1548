@@ -14,25 +14,80 @@ class CharacterGraph:
     def __init__(self):
         self._db: AsyncSurreal | None = None
         self._persons_cache: list[dict] | None = None  # 缓存全部人物，减少查询
+        # 连接参数（重连用）
+        self._url: str = ""
+        self._namespace: str = ""
+        self._database: str = ""
+        self._username: str = ""
+        self._password: str = ""
 
-    async def connect(self, url: str = "ws://localhost:8000", namespace: str = "apts", database: str = "main"):
+    async def connect(
+        self,
+        url: str = "ws://localhost:8000",
+        namespace: str = "apts",
+        database: str = "main",
+        username: str = "root",
+        password: str = "root",
+    ):
         """连接 SurrealDB 并选择命名空间和数据库。"""
+        self._url = url
+        self._namespace = namespace
+        self._database = database
+        self._username = username
+        self._password = password
+
         self._db = AsyncSurreal(url=url)
         await self._db.connect()
-        await self._db.signin({"username": "root", "password": "root"})
+        await self._db.signin({"username": username, "password": password})
         await self._db.use(namespace, database)
         logger.info(f"图谱 | 已连接 SurrealDB {url} ({namespace}/{database})")
         await self._refresh_cache()
 
     async def close(self):
         if self._db:
-            await self._db.close()
+            try:
+                await self._db.close()
+            except Exception:
+                pass
             self._db = None
             logger.info("图谱 | SurrealDB 连接已关闭")
 
+    async def _reconnect(self) -> bool:
+        """尝试重连 SurrealDB。成功返回 True。"""
+        if not self._url:
+            return False
+        try:
+            self._db = AsyncSurreal(url=self._url)
+            await self._db.connect()
+            await self._db.signin({"username": self._username, "password": self._password})
+            await self._db.use(self._namespace, self._database)
+            await self._refresh_cache()
+            logger.info("图谱 | 重连成功")
+            return True
+        except Exception as e:
+            logger.warning(f"图谱 | 重连失败: {e}")
+            self._db = None
+            return False
+
+    async def _query(self, sql: str, params: dict | None = None) -> list:
+        """执行查询，连接断开时自动重连一次。"""
+        for attempt in range(2):
+            try:
+                if params:
+                    result = await self._db.query(sql, params)
+                else:
+                    result = await self._db.query(sql)
+                return result if isinstance(result, list) else []
+            except Exception as e:
+                if attempt == 0 and self._url:
+                    logger.warning(f"图谱 | 查询失败，尝试重连: {e}")
+                    if await self._reconnect():
+                        continue
+                raise
+
     async def _refresh_cache(self):
         """刷新人物缓存。SDK 1.0.8 query 直接返回 list[dict]。"""
-        result = await self._db.query("SELECT * FROM person")
+        result = await self._query("SELECT * FROM person")
         self._persons_cache = result if isinstance(result, list) else []
         logger.debug(f"图谱 | 缓存 {len(self._persons_cache)} 个人物")
 
@@ -51,7 +106,7 @@ class CharacterGraph:
                     return p
 
         # 缓存没命中，查库
-        result = await self._db.query(
+        result = await self._query(
             "SELECT * FROM person WHERE aliases CONTAINS $alias",
             {"alias": alias},
         )
@@ -92,7 +147,7 @@ class CharacterGraph:
 
     async def get_connections(self, person_id: str) -> list[dict]:
         """查某人的所有关系（出边 + 入边）。"""
-        result = await self._db.query(
+        result = await self._query(
             "SELECT *, out.name AS to_name, in.name AS from_name "
             f"FROM knows WHERE in = person:{person_id} OR out = person:{person_id}",
         )
@@ -102,7 +157,7 @@ class CharacterGraph:
 
     async def get_relationship(self, person_a: str, person_b: str) -> list[dict]:
         """查两人之间的关系。"""
-        result = await self._db.query(
+        result = await self._query(
             f"SELECT * FROM knows WHERE "
             f"(in = person:{person_a} AND out = person:{person_b}) "
             f"OR (in = person:{person_b} AND out = person:{person_a})",
@@ -124,7 +179,7 @@ class CharacterGraph:
                         return False
                     break
 
-        await self._db.query(
+        await self._query(
             f"UPDATE person:{person_id} SET aliases += $alias",
             {"alias": alias},
         )
@@ -136,7 +191,7 @@ class CharacterGraph:
         self, from_id: str, to_id: str, rel_type: str, description: str = "",
     ):
         """添加人物间关系。"""
-        await self._db.query(
+        await self._query(
             f"RELATE person:{from_id}->knows->person:{to_id} "
             f"SET type = $type, description = $desc",
             {"type": rel_type, "desc": description},

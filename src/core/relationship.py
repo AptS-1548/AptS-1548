@@ -222,17 +222,23 @@ class RelationshipManager:
 
     def _save(self):
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self._path)), exist_ok=True)
+            dir_path = os.path.dirname(os.path.abspath(self._path))
+            os.makedirs(dir_path, exist_ok=True)
             data = {uid: asdict(p) for uid, p in self._profiles.items()}
-            with open(self._path, "w", encoding="utf-8") as f:
+            tmp_path = self._path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_path, self._path)  # 原子替换，崩溃安全
         except Exception as e:
             logger.warning(f"关系 | 保存失败: {e}")
 
     def _save_impression_ts(self):
         try:
-            os.makedirs(os.path.dirname(os.path.abspath(self._ts_path)), exist_ok=True)
-            with open(self._ts_path, "w", encoding="utf-8") as f:
+            dir_path = os.path.dirname(os.path.abspath(self._ts_path))
+            os.makedirs(dir_path, exist_ok=True)
+            tmp_path = self._ts_path + ".tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 json.dump(self._impression_ts, f)
+            os.replace(tmp_path, self._ts_path)  # 原子替换
         except Exception as e:
             logger.warning(f"关系 | 保存印象时间戳失败: {e}")

@@ -1,7 +1,26 @@
+import asyncio
+import re
+
 import anthropic
 from nonebot import get_driver, logger
 
 _client: anthropic.AsyncAnthropic | None = None
+_api_call_hook = None  # 可选回调，每次 API 调用后触发
+LLM_TIMEOUT_SEC = 120  # 单次 API 调用超时（秒）
+
+
+def set_api_call_hook(hook):
+    """注册 API 调用计数回调。由 __init__.py 调用。"""
+    global _api_call_hook
+    _api_call_hook = hook
+
+
+def _notify_api_call():
+    if _api_call_hook:
+        try:
+            _api_call_hook()
+        except Exception:
+            pass
 
 
 def _get_client() -> anthropic.AsyncAnthropic:
@@ -71,7 +90,16 @@ async def chat(
         kwargs["thinking"] = thinking
         kwargs["temperature"] = 1  # thinking 模式必须 temperature=1
 
-    response = await client.messages.create(**kwargs)
+    timeout = int(getattr(env, "llm_timeout_sec", LLM_TIMEOUT_SEC))
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(**kwargs),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"LLM 超时 | model={model} timeout={timeout}s")
+        raise
+    _notify_api_call()
 
     # thinking 模式下跳过 thinking block，取 text block
     text = ""
@@ -90,7 +118,6 @@ async def chat(
             break
 
     # 过滤内嵌 thinking 块（部分 proxy 会把 thinking 当文本返回）
-    import re
     thinking_match = re.search(r'<thinking>.*?</thinking>\s*', text, re.DOTALL)
     if thinking_match:
         logger.debug(f"thinking 泄露 | 已过滤 {len(thinking_match.group())} 字符")
@@ -140,15 +167,25 @@ async def chat_structured(
     model = getattr(env, "claude_model", "claude-opus-4-6")
     client = _get_client()
 
+    timeout = int(getattr(env, "llm_timeout_sec", LLM_TIMEOUT_SEC))
+
     # ── 第一次：tool_use 方式 ──
-    response = await client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
-        messages=messages,
-        tools=[tool],
-        tool_choice={"type": "tool", "name": tool["name"]},
-    )
+    try:
+        response = await asyncio.wait_for(
+            client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                messages=messages,
+                tools=[tool],
+                tool_choice={"type": "tool", "name": tool["name"]},
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"structured 超时 | timeout={timeout}s")
+        raise
+    _notify_api_call()
 
     # ── 检查 tool_use ──
     for block in response.content:
@@ -176,12 +213,20 @@ async def chat_structured(
         f"请严格按以下 JSON schema 回复，只输出一个 JSON 对象，不要任何其他文字：\n{schema}"
     )
 
-    retry = await client.messages.create(
-        model=model,
-        max_tokens=max_tokens,
-        system=[{"type": "text", "text": json_system, "cache_control": {"type": "ephemeral"}}],
-        messages=messages,
-    )
+    try:
+        retry = await asyncio.wait_for(
+            client.messages.create(
+                model=model,
+                max_tokens=max_tokens,
+                system=[{"type": "text", "text": json_system, "cache_control": {"type": "ephemeral"}}],
+                messages=messages,
+            ),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"structured 重试超时 | timeout={timeout}s")
+        raise
+    _notify_api_call()
 
     for block in retry.content:
         if block.type == "text":

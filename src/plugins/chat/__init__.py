@@ -15,11 +15,11 @@ from nonebot.adapters.onebot.v11 import (
     Message,
 )
 
-from core.llm import chat
+from core.llm import chat, set_api_call_hook
 from core.prompt import build_system_prompt, build_group_turns, format_impressions, format_diary, format_stories
 from core.guard import Guard
 from core.memory import Memory, MemoryEntry, format_memories
-from core.eval import evaluate_exchange, evaluate_batch
+from core.eval import evaluate_batch, EvalResult
 from core.relationship import RelationshipManager
 from core.summarize import generate_user_summary
 from core.diary import generate_diary_entry
@@ -109,6 +109,9 @@ def _new_tid() -> str:
     return format(random.randint(0, 0xFFFFFF), "06x")
 DEBOUNCE_SEC = 1.5
 BURST_COOLDOWN_SEC = 3.0  # 被取消后的冷静期，等用户说完
+
+# ── 后台任务追踪（graceful shutdown 用）──
+_background_tasks: list[asyncio.Task] = []
 
 
 def _update_attention(group_id: str, event: GroupMessageEvent, bot_id: str) -> float:
@@ -203,19 +206,54 @@ driver = get_driver()
 
 @driver.on_startup
 async def _startup():
-    asyncio.create_task(_attention_decay_loop())
-    asyncio.create_task(_rebuild_context())
-    asyncio.create_task(memory.cleanup_old_entries())
-    asyncio.create_task(_init_schedule())
-    asyncio.create_task(schedule_daily_loop(_get_diary_context))
-    asyncio.create_task(_proactive_loop())
-    asyncio.create_task(_task_loop())
+    # 注册 API 调用计数回调
+    set_api_call_hook(guard.record_api_call)
+
+    _background_tasks.extend([
+        asyncio.create_task(_attention_decay_loop()),
+        asyncio.create_task(_rebuild_context()),
+        asyncio.create_task(memory.cleanup_old_entries()),
+        asyncio.create_task(_init_schedule()),
+        asyncio.create_task(schedule_daily_loop(_get_diary_context)),
+        asyncio.create_task(_proactive_loop()),
+        asyncio.create_task(_task_loop()),
+    ])
     if plugin_config.diary_dedup_enabled:
-        asyncio.create_task(_diary_dedup_loop())
+        _background_tasks.append(asyncio.create_task(_diary_dedup_loop()))
     try:
-        await graph.connect(url=plugin_config.surrealdb_url)
+        await graph.connect(
+            url=plugin_config.surrealdb_url,
+            username=plugin_config.surrealdb_user,
+            password=plugin_config.surrealdb_password,
+        )
     except Exception as e:
         logger.warning(f"图谱 | SurrealDB 连接失败，别名功能不可用: {e}")
+
+
+@driver.on_shutdown
+async def _shutdown():
+    logger.info("正在关闭...")
+
+    # 刷完所有待处理的 eval buffer
+    for user_id in list(_eval_buffer.keys()):
+        try:
+            await _flush_eval(user_id)
+        except Exception as e:
+            logger.warning(f"关闭 | flush eval 失败 user={user_id}: {e}")
+
+    # 关闭 SurrealDB 连接
+    try:
+        await graph.close()
+    except Exception:
+        pass
+
+    # 取消后台任务
+    for task in _background_tasks:
+        if not task.done():
+            task.cancel()
+
+    replies, api = guard.daily_usage[0], guard.api_calls_today
+    logger.info(f"关闭完成 | 今日回复={replies} API调用={api}")
 
 
 async def _get_diary_context() -> str:
@@ -240,7 +278,8 @@ async def _init_schedule():
         logger.info(f"日程初始化 | 拉取 {len(diary_entries)} 条日记")
         if diary_context:
             logger.info(f"日程初始化 | 日记内容:\n{diary_context}")
-    except Exception:
+    except Exception as e:
+        logger.warning(f"日程初始化 | 日记获取失败: {e}")
         diary_context = ""
     await ensure_schedule(diary_context=diary_context, force=True)
 
@@ -504,11 +543,11 @@ async def _write_diary_entry(
         impressions = await memory.get_impressions(user_id=user_id, recent_limit=3, key_limit=2)
         if impressions:
             recent_context = "\n".join(f"- {m.message}" for m in impressions[:5])
-        diary_entries = await memory.get_diary(limit=3)
+        diary_entries = await memory.get_diary(recent_limit=3)
         if diary_entries:
             recent_diary = "\n".join(f"- {e.message}" for e in diary_entries)
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"日记上下文获取失败 | {e}")
 
     entry_text = await generate_diary_entry(user_name, message, response, importance, trust, recent_context, recent_diary, mentioned_names)
     if not entry_text:
@@ -545,12 +584,20 @@ async def _write_story_entry(
     try:
         diary_entries = await memory.get_diary(recent_limit=3)
         diary_texts = [e.message for e in diary_entries]
-    except Exception:
+    except Exception as e:
+        logger.warning(f"故事上下文获取失败 | {e}")
         diary_texts = []
 
     text = await generate_story(user_name, messages, resp, diary_texts, importance)
-    if text:
-        await memory.store_story(text, importance=importance)
+    if not text:
+        return
+
+    # 语义去重：避免同一事件生成重复故事
+    if await memory.is_story_duplicate(text):
+        logger.debug(f"故事跳过 | 语义重复: {text[:50]!r}")
+        return
+
+    await memory.store_story(text, importance=importance)
 
 
 async def _evaluate_and_store(
@@ -625,7 +672,8 @@ async def _flush_eval(user_id: str):
     # 取 pending tasks 给 eval 判断完成情况
     try:
         pending_contents = [t["content"] for t in await task_mgr.get_pending()]
-    except Exception:
+    except Exception as e:
+        logger.debug(f"eval 待办列表获取失败 | {e}")
         pending_contents = []
 
     # 组装 eval 上下文：对话对象信息 + 已知事实 + 最近日记
@@ -640,19 +688,19 @@ async def _flush_eval(user_id: str):
         if recent_diary:
             diary_lines = [f"- {e.message}" for e in recent_diary[:5]]
             eval_context_parts.append("48最近的状态：\n" + "\n".join(diary_lines))
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"eval 日记上下文获取失败 | {e}")
     eval_context = "\n".join(eval_context_parts)
 
-    importance, impression, trust_delta, facts, aliases, tasks, done_tasks, task_results = await evaluate_batch(
+    ev = await evaluate_batch(
         rounds,
         pending_tasks=pending_contents,
         context=eval_context,
     )
 
     # 新待办写入 + 解析 target
-    if tasks:
-        for t in tasks:
+    if ev.tasks:
+        for t in ev.tasks:
             try:
                 task_id = await task_mgr.add(t, user_name, source_qq=user_id)
                 # 从任务内容中解析目标人物
@@ -667,12 +715,12 @@ async def _flush_eval(user_id: str):
                 logger.warning(f"待办写入失败 | {e}")
 
     # 待办完成标记（附带结果摘要）
-    if done_tasks:
-        for d in done_tasks:
+    if ev.done_tasks:
+        for d in ev.done_tasks:
             try:
                 result = ""
-                if task_results:
-                    for r in task_results:
+                if ev.task_results:
+                    for r in ev.task_results:
                         if d in r and "：" in r:
                             result = r.split("：", 1)[1]
                             break
@@ -681,8 +729,8 @@ async def _flush_eval(user_id: str):
                 logger.warning(f"待办完成标记失败 | {e}")
 
     # 动态写入新别名到图谱
-    if aliases and graph._db:
-        for alias_pair in aliases:
+    if ev.aliases and graph._db:
+        for alias_pair in ev.aliases:
             try:
                 alias, real_name = alias_pair.split("=", 1)
                 person = await graph.resolve_name(real_name.strip())
@@ -694,16 +742,20 @@ async def _flush_eval(user_id: str):
 
     impression_key = f"{chat_type}_{chat_id}_{user_id}"
     cooldown_ok = (
-        importance >= 0.8
+        ev.importance >= 0.8
         or time.time() - relationship.get_impression_ts(impression_key) >= IMPRESSION_COOLDOWN_SEC
     )
-    should_store_impression = impression and importance >= 0.4 and cooldown_ok
+    should_store_impression = ev.impression and ev.importance >= 0.4 and cooldown_ok
 
-    logger.debug(f"eval flush | user={user_name} {len(rounds)}轮 imp={importance:.2f} trust={trust_delta:+} facts={facts} impression={impression!r} {'→ 存印象' if should_store_impression else '→ 跳过印象'}")
+    logger.debug(
+        f"eval flush | user={user_name} {len(rounds)}轮 imp={ev.importance:.2f} trust={ev.trust_delta:+} "
+        f"facts={ev.facts} impression={ev.impression!r} "
+        f"{'→ 存印象' if should_store_impression else '→ 跳过印象'}"
+    )
 
-    relationship.record_interaction(user_id, user_name, importance, trust_delta)
-    if facts:
-        relationship.add_facts(user_id, facts)
+    relationship.record_interaction(user_id, user_name, ev.importance, ev.trust_delta)
+    if ev.facts:
+        relationship.add_facts(user_id, ev.facts)
 
     if should_store_impression:
         relationship.set_impression_ts(impression_key, time.time())
@@ -712,9 +764,9 @@ async def _flush_eval(user_id: str):
             chat_type=chat_type,
             chat_id=chat_id,
             user_name=user_name,
-            message=impression,
+            message=ev.impression,
             response="",
-            importance=importance,
+            importance=ev.importance,
             record_type="impression",
         ))
 
@@ -722,15 +774,15 @@ async def _flush_eval(user_id: str):
     should_summarize = (
         (p.interaction_count > 0 and p.interaction_count % 10 == 0)
         or (not p.summary and p.interaction_count >= 5)
-        or abs(trust_delta) >= 3
-        or importance >= 0.8
+        or abs(ev.trust_delta) >= 3
+        or ev.importance >= 0.8
     )
     if should_summarize:
         asyncio.create_task(_update_user_summary(user_id, user_name))
 
     # diary
     last = rounds_info[-1]
-    should_write_diary = importance >= 0.6 or abs(trust_delta) >= 3
+    should_write_diary = ev.importance >= 0.6 or abs(ev.trust_delta) >= 3
     is_relay = False  # 标记：是否涉及第三方（传话场景）
     relay_names: list[str] = []  # 第三方人物名，传给 diary LLM 做代词消歧
 
@@ -739,8 +791,8 @@ async def _flush_eval(user_id: str):
         try:
             # 也把 impression 拼进去搜，LLM 可能把代词还原成名字
             conv_text = " ".join(f"{r['message']} {r['response']}" for r in rounds_info)
-            if impression:
-                conv_text += " " + impression
+            if ev.impression:
+                conv_text += " " + ev.impression
             mentioned = await graph.find_in_text(conv_text)
             # 排除对话对象自己，只看是否提到了"第三方"
             talker = graph.qq_to_person(user_id)
@@ -752,8 +804,8 @@ async def _flush_eval(user_id: str):
                 _relay_active[user_id] = time.time()
                 relay_names = [m["name"] for m in third_party]
                 logger.debug(f"日记触发 | 对话涉及第三方: {relay_names}")
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(f"日记第三方检测失败 | {e}")
 
     # 传话追踪：前一批 eval 触发了第三方日记，后续 eval 继续写日记
     if not should_write_diary and user_id in _relay_active:
@@ -777,19 +829,19 @@ async def _flush_eval(user_id: str):
         if not relay_names and graph._db:
             try:
                 all_text = full_msg + " " + full_resp
-                if impression:
-                    all_text += " " + impression
+                if ev.impression:
+                    all_text += " " + ev.impression
                 all_mentioned = await graph.find_in_text(all_text)
                 relay_names = [m["name"] for m in all_mentioned]
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug(f"日记人物检测失败 | {e}")
         asyncio.create_task(_write_diary_entry(
-            user_id, user_name, full_msg, full_resp, importance, relay_names or None,
+            user_id, user_name, full_msg, full_resp, ev.importance, relay_names or None,
         ))
 
     # 高 importance 事件 → 写故事（比 diary 丰富得多的完整叙述）
-    if importance >= 0.8:
-        asyncio.create_task(_write_story_entry(user_name, rounds_info, full_resp, importance))
+    if ev.importance >= 0.8:
+        asyncio.create_task(_write_story_entry(user_name, rounds_info, full_resp, ev.importance))
 
 
 async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool, search_query: str = ""):
@@ -922,6 +974,13 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         return
 
     logger.info(f"[{_tid()}] LLM ← | user={user_id} len={len(response)} time={elapsed:.1f}s")
+
+    # 空响应（thinking 泄露过滤后为空、LLM 异常等）→ 当作不回复处理
+    if not response.strip():
+        logger.warning(f"[{_tid()}] 空响应 | user={user_id}，视为不回复")
+        if not is_group:
+            _push_private(user_id, "assistant", "(已读不回)")
+        return
 
     # 48 可以选择不回复
     if "[不回复]" in response:

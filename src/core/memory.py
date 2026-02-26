@@ -748,6 +748,33 @@ class Memory:
             for _, p in scored[:limit]
         ]
 
+    async def is_story_duplicate(self, text: str, threshold: float = 0.80, hours: int = 24) -> bool:
+        """检查最近 N 小时内是否已存在语义相似的自创故事。"""
+        loop = asyncio.get_running_loop()
+        vector = await loop.run_in_executor(None, self._embed, text)
+        cutoff = time.time() - hours * 3600
+
+        try:
+            results = await loop.run_in_executor(None, lambda: self._client.query_points(
+                collection_name=COLLECTION,
+                query=vector,
+                query_filter=Filter(must=[
+                    FieldCondition(key="record_type", match=MatchValue(value="story")),
+                    FieldCondition(key="chat_type", match=MatchValue(value="narrative")),
+                    FieldCondition(key="timestamp", range=Range(gte=cutoff)),
+                ]),
+                limit=1,
+                with_payload=True,
+            ).points)
+
+            if results and results[0].score >= threshold:
+                dup_msg = results[0].payload.get("message", "")[:50]
+                logger.debug(f"故事去重 | 相似度 {results[0].score:.3f} >= {threshold} | 已有: {dup_msg!r}")
+                return True
+        except Exception as e:
+            logger.warning(f"故事去重检查失败 | {e}")
+        return False
+
     async def store_story(self, text: str, importance: float = 0.8) -> bool:
         """存储 48 自创的故事叙述。"""
         entry = MemoryEntry(
@@ -771,8 +798,10 @@ class Memory:
 
 # ── 格式化工具 ──
 
-def _time_label(timestamp: float) -> str:
-    """时间戳 → 可读标签，按本地自然日计算。今天/昨天带 HH:MM。"""
+def time_label(timestamp: float) -> str:
+    """时间戳 → 可读标签，按本地自然日计算。今天/昨天带 HH:MM。
+    公开函数，供 prompt.py 等模块复用。
+    """
     from datetime import datetime
     d = datetime.fromtimestamp(timestamp)
     delta = (datetime.now().date() - d.date()).days
@@ -782,6 +811,8 @@ def _time_label(timestamp: float) -> str:
         return f"昨天 {d.strftime('%H:%M')}"
     if delta < 7:
         return f"{delta}天前"
+    if delta < 30:
+        return f"{d.month}月{d.day}日"
     return f"{delta // 7}周前"
 
 
@@ -791,7 +822,7 @@ def format_memories(memories: list[MemoryEntry]) -> str:
         return ""
     lines = []
     for m in memories:
-        t = _time_label(m.timestamp)
+        t = time_label(m.timestamp)
         msg = m.message[:60].replace("\n", " ")
         resp = m.response[:60].replace("\n", " ")
         where = f"群{m.chat_id}" if m.chat_type == "group" else "私聊"
