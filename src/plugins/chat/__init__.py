@@ -650,7 +650,10 @@ def _reset_eval_timer(user_id: str):
 
     async def _timer():
         await asyncio.sleep(EVAL_FLUSH_TIMEOUT)
-        await _flush_eval(user_id)
+        try:
+            await _flush_eval(user_id)
+        except Exception as e:
+            logger.warning(f"eval timer flush 失败 | user={user_id}: {e}")
 
     _eval_timers[user_id] = asyncio.create_task(_timer())
 
@@ -970,7 +973,9 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     except Exception as e:
         elapsed = time.time() - t0
         logger.error(f"[{_tid()}] LLM ✗ | user={user_id} time={elapsed:.1f}s error={e}")
-        logger.exception(e)
+        # 私聊历史里已经 push 了 user 消息，补一条失败标记保持配对
+        if not is_group:
+            _push_private(user_id, "assistant", "(连接失败，没回上)")
         return
 
     logger.info(f"[{_tid()}] LLM ← | user={user_id} len={len(response)} time={elapsed:.1f}s")
