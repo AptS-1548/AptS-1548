@@ -341,8 +341,12 @@ async def _proactive_loop():
     await asyncio.sleep(300)  # 启动后等 5 分钟再开始
     logger.info(f"主动 loop 启动 | 间隔={plugin_config.proactive_check_sec}s 冷却={plugin_config.proactive_cooldown_sec}s")
 
+    first_run = True
     while True:
-        await asyncio.sleep(plugin_config.proactive_check_sec)
+        if first_run:
+            first_run = False
+        else:
+            await asyncio.sleep(plugin_config.proactive_check_sec)
         try:
             bot: Bot = nonebot.get_bot()
         except ValueError:
@@ -401,8 +405,12 @@ async def _task_loop():
     await asyncio.sleep(120)  # 启动等 2 分钟
     logger.info("待办 loop 启动 | 间隔=300s")
 
+    first_run = True
     while True:
-        await asyncio.sleep(300)
+        if first_run:
+            first_run = False
+        else:
+            await asyncio.sleep(300)
         try:
             bot: Bot = nonebot.get_bot()
         except ValueError:
@@ -656,6 +664,7 @@ def _reset_eval_timer(user_id: str):
             logger.warning(f"eval timer flush 失败 | user={user_id}: {e}")
 
     _eval_timers[user_id] = asyncio.create_task(_timer())
+    logger.debug(f"eval timer 启动 | user={user_id} timeout={EVAL_FLUSH_TIMEOUT}s")
 
 
 async def _flush_eval(user_id: str):
@@ -664,7 +673,10 @@ async def _flush_eval(user_id: str):
     _cancel_eval_timer(user_id)
 
     if not rounds_info:
+        logger.debug(f"eval flush | user={user_id} buffer 为空，跳过")
         return
+
+    logger.info(f"eval flush 开始 | user={user_id} {len(rounds_info)}轮")
 
     # 构造 eval 输入
     rounds = [(r["user_name"], r["message"], r["response"]) for r in rounds_info]
