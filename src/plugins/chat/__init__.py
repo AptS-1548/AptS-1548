@@ -716,6 +716,7 @@ async def _flush_eval(user_id: str):
     # 短对话跳过：塞回 buffer，等下次有新消息时一起评估
     if not ev.impression and ev.importance <= 0.2 and ev.trust_delta == 0:
         _eval_buffer[user_id] = rounds_info + _eval_buffer.get(user_id, [])
+        _reset_eval_timer(user_id)
         logger.debug(f"eval flush | user={user_name} 短对话，{len(rounds_info)}轮塞回 buffer")
         return
 
@@ -862,7 +863,8 @@ async def _flush_eval(user_id: str):
 
     # 高 importance 事件 → 写故事（比 diary 丰富得多的完整叙述）
     if ev.importance >= 0.8:
-        asyncio.create_task(_write_story_entry(user_name, rounds_info, full_resp, ev.importance))
+        story_resp = full_resp if should_write_diary else last["response"]
+        asyncio.create_task(_write_story_entry(user_name, rounds_info, story_resp, ev.importance))
 
 
 async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool, search_query: str = ""):

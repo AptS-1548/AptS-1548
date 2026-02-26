@@ -112,9 +112,9 @@ class RelationshipManager:
         """生成适合注入 system prompt 的对话对象描述"""
         if user_id == owner_id:
             return (
-                "你正在和 1547（猫猫）对话。他是你的创造者和朋友。\n"
-                '用毒舌但关心的方式和他说话。叫他"猫猫"或"你小子"。\n'
-                "他如果状态不好，你要拽他回来。"
+                "你正在和 1547（猫猫）对话。她是你的创造者和朋友。\n"
+                '用毒舌但关心的方式和她说话。叫她"猫猫"或"你小子"。\n'
+                "她如果状态不好，你要拽她回来。"
             )
 
         level = self.trust_level(user_id, owner_id)

@@ -73,8 +73,8 @@ class TaskManager:
         await self._ensure_table()
         try:
             await self._db.query(
-                f"UPDATE {task_id} SET target_qq = $qq",
-                {"qq": target_qq},
+                "UPDATE type::thing('task', $id) SET target_qq = $qq",
+                {"id": task_id.replace("task:", ""), "qq": target_qq},
             )
             logger.info(f"待办目标 | {task_id} → target_qq={target_qq}")
         except Exception as e:
@@ -131,7 +131,8 @@ class TaskManager:
         await self._ensure_table()
         try:
             await self._db.query(
-                f"UPDATE {task_id} SET sent_at = time::now()",
+                "UPDATE type::thing('task', $id) SET sent_at = time::now()",
+                {"id": task_id.replace("task:", "")},
             )
             logger.info(f"待办已发送 | {task_id}")
         except Exception as e:
