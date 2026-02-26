@@ -184,6 +184,7 @@ async def check_proactive(
 async def check_schedule_proactive(
     relationship: RelationshipManager,
     owner_id: str,
+    graph=None,
 ) -> list[tuple[str, str]]:
     """日程驱动：检查当前日程是否提到某人，返回 [(user_id, activity), ...]。
 
@@ -211,7 +212,7 @@ async def check_schedule_proactive(
             continue
 
         # 在活动文本里找人名
-        matched = relationship.find_by_activity(entry.activity, owner_id)
+        matched = await relationship.find_by_activity(entry.activity, owner_id, graph=graph)
         if matched:
             _triggered_entries.add(entry_key)
             for uid in matched:
@@ -245,4 +246,41 @@ async def generate_schedule_message(
 
     result = result.strip()
     logger.info(f"日程主动 | → {name} | activity={activity!r} msg={result!r}")
+    return result
+
+
+# ── 待办驱动 ──
+
+_SYSTEM_TASK = """你是 48。{source}拜托你一件事："{content}"
+你要给{name}发一条消息把这事说了。
+
+像平时在QQ上发消息一样，一条，简短，直接说事。
+不用说"xxx让我跟你说"，直接说事情本身。"""
+
+
+async def generate_task_message(
+    content: str,
+    source: str,
+    target_name: str,
+) -> str | None:
+    """为待办任务生成发给 target 的消息。"""
+    system = _SYSTEM_TASK.format(
+        source=source,
+        content=content,
+        name=target_name,
+    )
+
+    try:
+        result = await chat(
+            system=system,
+            messages=[{"role": "user", "content": f"给{target_name}发一条消息。"}],
+            max_tokens=128,
+            disable_thinking=True,
+        )
+    except Exception as e:
+        logger.warning(f"待办消息 | {target_name} LLM 失败: {e}")
+        return None
+
+    result = result.strip()
+    logger.info(f"待办消息 | → {target_name} | task={content!r} msg={result!r}")
     return result

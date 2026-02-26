@@ -167,17 +167,26 @@ class RelationshipManager:
             and p.trust >= 60
         ]
 
-    def find_by_activity(self, activity: str, owner_id: str) -> list[str]:
+    async def find_by_activity(self, activity: str, owner_id: str, graph=None) -> list[str]:
         """在活动文本中匹配已知用户名，返回匹配到的 user_id 列表。
 
-        匹配逻辑：user_name 的任何 >= 2 字的子串出现在 activity 中。
-        跳过 owner（owner 走单独的主动逻辑）。
+        如果提供了 graph（CharacterGraph），用图数据库的别名做匹配，覆盖面更广。
+        否则 fallback 到原有的子串匹配。
         """
+        if graph:
+            matches = await graph.find_in_text(activity)
+            result = [
+                m["qq_id"] for m in matches
+                if m.get("qq_id") and m["qq_id"] != owner_id
+            ]
+            logger.debug(f"活动匹配(图谱) | {activity!r} → {result}")
+            return result
+
+        # fallback：原有逻辑
         matched = []
         for p in self._profiles.values():
             if p.user_id == owner_id or not p.user_name:
                 continue
-            # 用 user_name 直接匹配，也尝试去掉姓的短名
             names_to_check = [p.user_name]
             if len(p.user_name) >= 3:
                 names_to_check.append(p.user_name[1:])  # 去掉姓
@@ -185,6 +194,8 @@ class RelationshipManager:
                 if len(name) >= 2 and name in activity:
                     matched.append(p.user_id)
                     break
+        if matched:
+            logger.debug(f"活动匹配(fallback) | {activity!r} → {matched}")
         return matched
 
     def _load(self):

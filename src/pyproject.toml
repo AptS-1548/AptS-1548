@@ -9,6 +9,7 @@ dependencies = [
     "anthropic>=0.40.0",
     "qdrant-client>=1.7.0",
     "sentence-transformers>=3.0.0",
+    "surrealdb>=1.0.0",
 ]
 
 [tool.nonebot]

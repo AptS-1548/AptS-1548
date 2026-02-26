@@ -192,6 +192,7 @@ def build_system_prompt(
     relationship_context: str = "",
     diary_context: str = "",
     schedule_context: str = "",
+    task_context: str = "",
 ) -> tuple[str, str]:
     """返回 (stable, dynamic) 两段 system prompt。
     stable 部分不变可缓存，dynamic 部分每次不同不缓存。
@@ -205,6 +206,9 @@ def build_system_prompt(
 
     if schedule_context:
         dynamic_parts.append(schedule_context)
+
+    if task_context:
+        dynamic_parts.append(task_context)
 
     if diary_context:
         dynamic_parts.append(diary_context)

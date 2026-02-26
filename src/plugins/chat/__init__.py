@@ -24,7 +24,9 @@ from core.relationship import RelationshipManager
 from core.summarize import generate_user_summary
 from core.diary import generate_diary_entry
 from core.schedule import ensure_schedule, get_willingness, format_schedule_context, schedule_daily_loop
-from core.proactive import check_proactive, check_schedule_proactive, generate_schedule_message
+from core.proactive import check_proactive, check_schedule_proactive, generate_schedule_message, generate_task_message
+from core.graph import CharacterGraph
+from core.task import TaskManager
 
 from .config import Config
 
@@ -44,6 +46,8 @@ guard = Guard(
 
 memory = Memory(qdrant_url=plugin_config.qdrant_url)
 relationship = RelationshipManager()
+graph = CharacterGraph()
+task_mgr = TaskManager(graph)
 
 # ── 私聊：多轮对话历史 ──
 _private_histories: dict[str, list[dict]] = defaultdict(list)
@@ -84,6 +88,10 @@ _eval_buffer: dict[str, list[dict]] = defaultdict(list)  # user_id -> [round_inf
 _eval_timers: dict[str, asyncio.Task] = {}  # user_id -> flush timer
 EVAL_BATCH_SIZE = 3       # 攒满 N 轮触发 eval
 EVAL_FLUSH_TIMEOUT = 120  # 超时 N 秒自动 flush
+
+# ── 传话追踪：前一批 eval 触发了第三方日记，后续 eval 继续写日记 ──
+_relay_active: dict[str, float] = {}  # user_id -> 触发时间戳
+RELAY_WINDOW_SEC = 600  # 10 分钟内持续追踪
 
 # ── 印象去重：同一用户/群 2 小时内只存一次印象（运行时 + 持久化通过 relationship）──
 IMPRESSION_COOLDOWN_SEC = 2 * 3600
@@ -200,8 +208,13 @@ async def _startup():
     asyncio.create_task(_init_schedule())
     asyncio.create_task(schedule_daily_loop(_get_diary_context))
     asyncio.create_task(_proactive_loop())
+    asyncio.create_task(_task_loop())
     if plugin_config.diary_dedup_enabled:
         asyncio.create_task(_diary_dedup_loop())
+    try:
+        await graph.connect(url=plugin_config.surrealdb_url)
+    except Exception as e:
+        logger.warning(f"图谱 | SurrealDB 连接失败，别名功能不可用: {e}")
 
 
 async def _get_diary_context() -> str:
@@ -253,7 +266,7 @@ async def _send_proactive(bot: Bot, target_id: str, msg: str, label: str = ""):
 
 
 async def _diary_dedup_loop():
-    """后台循环：每天 0:30 自动执行日记语义去重。"""
+    """后台循环：每天 0:30 自动执行日记语义去重 + 压缩。"""
     import datetime as _dt
     while True:
         now = _dt.datetime.now()
@@ -274,6 +287,14 @@ async def _diary_dedup_loop():
         except Exception as e:
             logger.warning(f"日记去重 loop | 失败: {e}")
 
+        # 去重后压缩：把流水账合并成回忆
+        try:
+            consolidated = await memory.consolidate_diary(min_entries=8)
+            if consolidated:
+                logger.info(f"日记压缩 loop | 完成，压缩 {consolidated} 条")
+        except Exception as e:
+            logger.warning(f"日记压缩 loop | 失败: {e}")
+
 
 async def _proactive_loop():
     """后台定时检查，触发 48 主动联系 owner 和朋友。"""
@@ -291,7 +312,7 @@ async def _proactive_loop():
 
         # ── Part 1: 日程驱动 ──
         try:
-            schedule_contacts = await check_schedule_proactive(relationship, owner_id)
+            schedule_contacts = await check_schedule_proactive(relationship, owner_id, graph=graph)
             for target_id, activity in schedule_contacts:
                 msg = await generate_schedule_message(target_id, activity, relationship, owner_id)
                 if msg:
@@ -333,6 +354,47 @@ async def _proactive_loop():
                     await _send_proactive(bot, friend.user_id, msg, label=friend.user_name or friend.user_id)
         except Exception as e:
             logger.warning(f"主动检查异常(friend) | {e}")
+
+
+async def _task_loop():
+    """每 5 分钟扫描 pending tasks，主动联系事件对象。"""
+    await asyncio.sleep(120)  # 启动等 2 分钟
+    logger.info("待办 loop 启动 | 间隔=300s")
+
+    while True:
+        await asyncio.sleep(300)
+        try:
+            bot: Bot = nonebot.get_bot()
+        except ValueError:
+            continue
+
+        try:
+            actionable = await task_mgr.get_actionable()
+        except Exception as e:
+            logger.warning(f"待办 loop 查询失败 | {e}")
+            continue
+
+        for task in actionable:
+            target_qq = task.get("target_qq")
+            content = task.get("content", "")
+            source = task.get("source_user", "")
+            task_id = str(task.get("id", ""))
+
+            if not target_qq or not task_id:
+                continue
+
+            target_person = graph.qq_to_person(target_qq)
+            target_name = target_person["name"] if target_person else target_qq
+
+            try:
+                msg = await generate_task_message(content, source, target_name)
+            except Exception as e:
+                logger.warning(f"待办 loop 消息生成失败 | {target_name} {e}")
+                continue
+
+            if msg:
+                await _send_proactive(bot, target_qq, msg, label=f"待办→{target_name}")
+                await task_mgr.mark_sent(task_id)
 
 
 async def _rebuild_context():
@@ -429,6 +491,7 @@ async def _write_diary_entry(
     message: str,
     response: str,
     importance: float,
+    mentioned_names: list[str] | None = None,
 ) -> None:
     """异步生成并存储 48 的日记条目。拉取最近印象作为上下文，让日记有更广的视野。"""
     trust = relationship.get(user_id).trust
@@ -446,7 +509,7 @@ async def _write_diary_entry(
     except Exception:
         pass
 
-    entry_text = await generate_diary_entry(user_name, message, response, importance, trust, recent_context, recent_diary)
+    entry_text = await generate_diary_entry(user_name, message, response, importance, trust, recent_context, recent_diary, mentioned_names)
     if not entry_text:
         return
 
@@ -473,22 +536,6 @@ async def _evaluate_and_store(
     user_name: str, message: str, response: str,
 ):
     """将对话记录存入 Qdrant，eval 部分丢进 buffer 攒批处理。"""
-
-    # owner 跳过 eval，直接存 + 写日记 + 更新互动时间
-    if user_id == plugin_config.owner_id:
-        relationship.record_interaction(user_id, user_name, 0.5, 0)
-        await memory.store(MemoryEntry(
-            user_id=user_id,
-            chat_type=chat_type,
-            chat_id=chat_id,
-            user_name=user_name,
-            message=message,
-            response=response,
-            importance=0.5,
-            record_type="dialog",
-        ))
-        asyncio.create_task(_write_diary_entry(user_id, user_name, message, response, importance=0.7))
-        return
 
     # 立即存 dialog（不等 eval），importance 暂用 0.5
     await memory.store(MemoryEntry(
@@ -553,7 +600,75 @@ async def _flush_eval(user_id: str):
     chat_type = rounds_info[-1]["chat_type"]
     chat_id = rounds_info[-1]["chat_id"]
 
-    importance, impression, trust_delta, facts = await evaluate_batch(rounds)
+    # 取 pending tasks 给 eval 判断完成情况
+    try:
+        pending_contents = [t["content"] for t in await task_mgr.get_pending()]
+    except Exception:
+        pending_contents = []
+
+    # 组装 eval 上下文：对话对象信息 + 已知事实 + 最近日记
+    eval_context_parts = []
+    p = relationship.get(user_id)
+    level = relationship.trust_level(user_id, plugin_config.owner_id)
+    eval_context_parts.append(f"对话对象：{user_name}（{level}，信任度{p.trust:.0f}）")
+    if p.facts:
+        eval_context_parts.append("已知信息：" + "、".join(p.facts[:5]))
+    try:
+        recent_diary = await memory.get_diary(recent_limit=5)
+        if recent_diary:
+            diary_lines = [f"- {e.message}" for e in recent_diary[:5]]
+            eval_context_parts.append("48最近的状态：\n" + "\n".join(diary_lines))
+    except Exception:
+        pass
+    eval_context = "\n".join(eval_context_parts)
+
+    importance, impression, trust_delta, facts, aliases, tasks, done_tasks, task_results = await evaluate_batch(
+        rounds,
+        pending_tasks=pending_contents,
+        context=eval_context,
+    )
+
+    # 新待办写入 + 解析 target
+    if tasks:
+        for t in tasks:
+            try:
+                task_id = await task_mgr.add(t, user_name, source_qq=user_id)
+                # 从任务内容中解析目标人物
+                if task_id and graph._db:
+                    mentioned = await graph.find_in_text(t)
+                    source_person = graph.qq_to_person(user_id)
+                    source_pid = str(source_person.get("id", "")) if source_person else ""
+                    targets = [m for m in mentioned if str(m.get("id", "")) != source_pid]
+                    if targets and targets[0].get("qq_id"):
+                        await task_mgr.set_target(task_id, targets[0]["qq_id"])
+            except Exception as e:
+                logger.warning(f"待办写入失败 | {e}")
+
+    # 待办完成标记（附带结果摘要）
+    if done_tasks:
+        for d in done_tasks:
+            try:
+                result = ""
+                if task_results:
+                    for r in task_results:
+                        if d in r and "：" in r:
+                            result = r.split("：", 1)[1]
+                            break
+                await task_mgr.mark_done(d, result=result)
+            except Exception as e:
+                logger.warning(f"待办完成标记失败 | {e}")
+
+    # 动态写入新别名到图谱
+    if aliases and graph._db:
+        for alias_pair in aliases:
+            try:
+                alias, real_name = alias_pair.split("=", 1)
+                person = await graph.resolve_name(real_name.strip())
+                if person:
+                    person_id = str(person["id"]).replace("person:", "")
+                    await graph.add_alias(person_id, alias.strip())
+            except Exception as e:
+                logger.debug(f"图谱 | 别名写入跳过: {alias_pair!r} {e}")
 
     impression_key = f"{chat_type}_{chat_id}_{user_id}"
     cooldown_ok = (
@@ -591,12 +706,63 @@ async def _flush_eval(user_id: str):
     if should_summarize:
         asyncio.create_task(_update_user_summary(user_id, user_name))
 
-    # diary：用最后一轮的内容
+    # diary
     last = rounds_info[-1]
     should_write_diary = importance >= 0.6 or abs(trust_delta) >= 3
+    is_relay = False  # 标记：是否涉及第三方（传话场景）
+    relay_names: list[str] = []  # 第三方人物名，传给 diary LLM 做代词消歧
+
+    # 涉及第三方人物的对话也写日记（传话、讨论别人的事）
+    if not should_write_diary and graph._db:
+        try:
+            # 也把 impression 拼进去搜，LLM 可能把代词还原成名字
+            conv_text = " ".join(f"{r['message']} {r['response']}" for r in rounds_info)
+            if impression:
+                conv_text += " " + impression
+            mentioned = await graph.find_in_text(conv_text)
+            # 排除对话对象自己，只看是否提到了"第三方"
+            talker = graph.qq_to_person(user_id)
+            talker_id = str(talker.get("id", "")) if talker else ""
+            third_party = [m for m in mentioned if str(m.get("id", "")) != talker_id]
+            if third_party:
+                should_write_diary = True
+                is_relay = True
+                _relay_active[user_id] = time.time()
+                relay_names = [m["name"] for m in third_party]
+                logger.debug(f"日记触发 | 对话涉及第三方: {relay_names}")
+        except Exception:
+            pass
+
+    # 传话追踪：前一批 eval 触发了第三方日记，后续 eval 继续写日记
+    if not should_write_diary and user_id in _relay_active:
+        if time.time() - _relay_active[user_id] < RELAY_WINDOW_SEC:
+            should_write_diary = True
+            is_relay = True
+            _relay_active[user_id] = time.time()  # 续期
+            logger.debug(f"日记触发 | 传话追踪延续 user={user_name}")
+        else:
+            del _relay_active[user_id]
+
     if should_write_diary:
+        # 传话场景：把所有轮次拼起来给 diary LLM，让它能看到完整上下文写出具体内容
+        if is_relay and len(rounds_info) > 1:
+            full_msg = "\n".join(f"{r['user_name']}：{r['message']}\n48：{r['response']}" for r in rounds_info)
+            full_resp = ""
+        else:
+            full_msg = last["message"]
+            full_resp = last["response"]
+        # 非 relay 场景也尝试检测提到的人物，帮日记 LLM 消歧代词
+        if not relay_names and graph._db:
+            try:
+                all_text = full_msg + " " + full_resp
+                if impression:
+                    all_text += " " + impression
+                all_mentioned = await graph.find_in_text(all_text)
+                relay_names = [m["name"] for m in all_mentioned]
+            except Exception:
+                pass
         asyncio.create_task(_write_diary_entry(
-            user_id, user_name, last["message"], last["response"], importance,
+            user_id, user_name, full_msg, full_resp, importance, relay_names or None,
         ))
 
 
@@ -617,6 +783,22 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         return
 
     chat_id = group_id if is_group else user_id
+
+    # 图谱别名展开：用户提到"沈老师"，展开为"沈老师 沈沐川"，让向量搜索覆盖更多命中
+    if graph._db:
+        try:
+            matched_persons = await graph.find_in_text(search_query)
+            expand_names = []
+            for p in matched_persons:
+                # 把该人物的所有别名中、不在原文里的那些补上
+                for alias in p.get("aliases", []):
+                    if len(alias) >= 2 and alias not in search_query:
+                        expand_names.append(alias)
+            if expand_names:
+                search_query = search_query + " " + " ".join(expand_names)
+                logger.debug(f"[{_tid()}] 图谱展开 | 补充别名: {expand_names}")
+        except Exception as e:
+            logger.debug(f"[{_tid()}] 图谱展开跳过 | {e}")
 
     # 懒加载：首次私聊时从 Qdrant 重建历史
     if not is_group and user_id not in _rebuilt_private_users:
@@ -663,6 +845,9 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     await ensure_schedule(diary_context=diary_context)
     schedule_context = format_schedule_context()
 
+    # 待办事项
+    task_context = await task_mgr.format_for_prompt(current_user=user_name, current_qq=user_id)
+
     rel_level = relationship.trust_level(user_id, plugin_config.owner_id)
     rel_context = relationship.format_context(user_id, user_name, plugin_config.owner_id)
     logger.debug(f"[{_tid()}] 关系 | user={user_name} level={rel_level} trust={relationship.get(user_id).trust:.1f}")
@@ -672,6 +857,8 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         logger.debug(f"[{_tid()}] 注入记忆 |\n{memory_context}")
     if impression_context:
         logger.debug(f"[{_tid()}] 注入印象 |\n{impression_context}")
+    if task_context:
+        logger.debug(f"[{_tid()}] 注入待办 |\n{task_context}")
 
     system, system_dynamic = build_system_prompt(
         user_id=user_id,
@@ -682,6 +869,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         relationship_context=rel_context,
         diary_context=diary_context,
         schedule_context=schedule_context,
+        task_context=task_context,
     )
 
     if is_group:

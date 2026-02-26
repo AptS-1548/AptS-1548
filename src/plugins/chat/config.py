@@ -39,3 +39,6 @@ class Config(BaseModel):
     diary_dedup_enabled: bool = False   # 是否启用每日自动去重
     diary_dedup_threshold: float = 0.85 # 语义相似度阈值
     diary_dedup_window: int = 15        # 时间窗口（分钟）
+
+    # SurrealDB 人物图谱
+    surrealdb_url: str = "ws://localhost:8000"  # SurrealDB 连接地址

@@ -1,0 +1,19 @@
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - ./data/qdrant/storage:/qdrant/storage
+      - ./data/qdrant/snapshots:/qdrant/snapshots
+    restart: unless-stopped
+
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    command: start --user root --pass root surrealkv:/data/srdb.db
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./data/surrealdb:/data
+    restart: unless-stopped

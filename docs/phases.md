@@ -7,7 +7,7 @@ Phase 1: 基础行为系统      ✅ 完成   ← 注意力、防抖、冷却、
 Phase 2: 长期记忆          ✅ 完成   ← Qdrant 向量存储、检索注入、重启重建
 Phase 3: 记忆进化          ✅ 完成   ← 评估系统、分层印象、事实提取、周期摘要
 Phase 4: 关系系统          ✅ 完成   ← 信任等级、用户画像、敌对机制
-Phase 5: 主动行为          🚧 进行中 ← diary → 日程 → 主动关心 → 日记去重 → 故事RAG
+Phase 5: 主动行为          🚧 进行中 ← diary → 日程 → 主动关心 → 图谱 → 待办 → 日记压缩 → 故事RAG
 Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替换 Claude API
 ```
 
@@ -70,7 +70,8 @@ Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替�
 - 三因子加权重排：`similarity×0.6 + recency×0.2 + importance×0.2`
 - 相似度阈值 0.5，importance < 0.2 过滤噪音
 - 群聊按 `chat_id` 隔离，私聊按 `user_id` 跨群检索
-- 向量无结果时 fallback 到最近 3 条 `dialog`
+- **全局 fallback**：范围内搜索无结果时，去掉 chat/user 限制全局再搜一次（跨聊天找相关记忆）
+- 全局也无结果时 fallback 到最近 3 条 `dialog`
 
 **重启后上下文重建**
 - 启动时：从 Qdrant 拉最近记录重建 `_group_context`
@@ -88,12 +89,17 @@ Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替�
 
 **对话评估（`core/eval.py`）**
 - 每次对话结束后异步 LLM 调用（不阻塞发消息）
-- 单次调用返回四个字段：
+- batch eval：攒 3 轮或超时 120s 批量评估，dialog 立即存储（默认 importance=0.5）
+- 单次调用返回八个字段：
   - `importance`（0.0~1.0）：对话重要性
   - `impression`（≤50字）：48 视角的主观印象
   - `trust_delta`（-5~+5 整数）：对这次互动的信任评估
   - `facts`（list）：从用户发言中提取的事实信息
-- owner 的消息跳过 eval，直接存 dialog（省 API）
+  - `aliases`（list）：对话中出现的新称呼/别名（格式 `别名=真名`）
+  - `tasks`（list）：48 需要去做的事（待办提取）
+  - `done_tasks`（list）：这段对话完成了哪些待办
+  - `task_results`（list）：已完成待办的结果摘要
+- eval 接收上下文：对话对象信息、已知事实、最近日记、pending 待办列表
 
 **印象系统**
 - 存储条件：`importance >= 0.4` 且满足冷却（同用户/群 2h 内只存一次）
@@ -170,12 +176,16 @@ facts,     # 从对话提取的事实列表
 **diary 生成（`core/diary.py`）**
 - 高 importance 对话后（`>= 0.6`）或关键信任变化（`|trust_delta| >= 3`）自动触发
 - LLM 以第一人称写 ≤30 字日记，口语化，提到人用名字不用代词
+- **优先记录计划/约定/承诺**（如"和沐川约了下午三点喝奶茶"），有时间地点就写上
 - 输入：对话内容 + 信任度 + 最近印象 + 最近已有日记（防重复）
 
 **存储**
 - `record_type="diary"`, `user_id="48"`，与用户记忆隔离
 - 存入 Qdrant，不参与用户维度的检索
-- **语义去重**：存储前用向量搜索最近 24h 的日记，cosine >= 0.85 视为重复跳过
+- **实时语义去重**：存储前用向量搜索最近 24h 的日记，cosine >= 0.85 视为重复跳过
+- **定时批量去重**：每天 0:30 自动执行，条件：cosine >= 阈值 且 时间间隔 <= 窗口（默认 15 分钟）
+- 可通过 `DIARY_DEDUP_ENABLED` 开关，`DIARY_DEDUP_THRESHOLD` / `DIARY_DEDUP_WINDOW` 调参
+- 附带独立脚本 `scripts/dedup_diary.py` 可手动执行（`--apply` 真删，默认预览）
 - 存储日志细化：`记忆存储 | type=diary user=48 msg=...`
 
 **检索与注入**
@@ -270,7 +280,172 @@ facts,     # 从对话提取的事实列表
 
 ---
 
-### 5.4 故事 RAG ⬜
+### 5.4 人物关系图谱 ✅
+
+**已完成内容**
+
+**技术栈**
+- 图数据库：SurrealDB（Rust 实现，多模型，Docker 部署）
+- Python SDK：`surrealdb >= 1.0.0`
+- 数据引擎：`surrealkv` 持久化
+
+**数据模型**
+```
+person 表 — 人物节点
+  id, name, code, aliases[], role, qq_id
+
+knows 边 — 人物间关系
+  in -> out, type, description
+```
+
+**初始数据（`scripts/init_graph.py`）**
+- 9 个人物节点（1547/1548/1549/1543/2275/1738/0152/3167/4869）
+- 11 条关系边（created_by, sister, colleague, friend, alter_ego, respect）
+- 每个人物带别名列表，支持多称呼映射
+
+**核心能力（`core/graph.py`）**
+- `resolve_name(alias)` — 别名解析：`"沈老师"` → 沈沐川 (person:1543)
+- `find_in_text(text)` — 文本匹配：`"和沐川去喝奶茶"` → [沈沐川]
+- `get_connections(person_id)` — 查某人的所有关系
+- `qq_to_person(qq_id)` — QQ ID 反查人物
+- `add_alias(person_id, alias)` — 动态添加新别名
+- 内置缓存机制，全部人物一次性加载到内存，减少查询
+
+**动态别名发现**
+- eval 新增 `aliases` 字段，LLM 从对话中提取新称呼
+- 格式 `"别名=真名"`（如 `"沈老师=沈沐川"`）
+- eval 后自动调 `graph.resolve_name()` + `graph.add_alias()` 写入
+
+**集成点**
+- `relationship.find_by_activity()` — 改为 async，优先走图查询匹配人物，fallback 原有逻辑
+- `proactive.check_schedule_proactive()` — 日程匹配人物时用图数据库别名
+- `__init__.py._startup()` — 启动时连接 SurrealDB（失败不阻塞，graceful degradation）
+
+**数据分工**
+```
+SurrealDB   → 人物身份、别名、人物间关系图、QQ ID 映射
+Qdrant      → 对话记忆、日记、印象（不变）
+JSON        → trust/interaction/facts/summary（不变）
+```
+
+**配置**
+- `SURREALDB_URL=ws://localhost:8000`
+- Docker: `docker-compose.yml`（项目根目录）
+
+---
+
+### 5.5 跨对话信息传递 ✅
+
+**已完成内容**
+
+**传话追踪**
+- 对话涉及第三方人物时自动触发日记（传话场景）
+- `graph.find_in_text()` 检测对话文本中提到的已知人物
+- 排除对话对象自己，只看是否提到"第三方"
+- `_relay_active` 追踪窗口（默认 600s），窗口内后续对话继续写日记
+- 传话场景下把所有轮次拼起来给 diary LLM，让它看到完整上下文
+
+**日记代词消歧**
+- `generate_diary_entry()` 接收 `mentioned_names` 参数
+- 告诉 diary LLM 对话中提到了哪些人物，避免写"有人""他""她"
+- relay 和非 relay 场景都会检测提到的人物
+
+---
+
+### 5.6 待办事项系统 ✅
+
+**已完成内容**
+
+**数据模型（SurrealDB `task` 表）**
+```
+task:ulid
+├── content: str           # "帮47喊清弦拿电脑工卡"
+├── source_user: str       # 请求人名字
+├── source_qq: str         # 请求人 QQ ID
+├── target_qq: option<str> # 目标人 QQ ID
+├── status: str            # "pending" | "done" | "expired"
+├── created_at: datetime
+├── sent_at: option<datetime>   # 主动消息发送时间
+├── done_at: option<datetime>
+├── done_result: option<str>    # 完成结果摘要（≤100字）
+```
+
+**待办提取（eval → task）**
+- eval 新增 `tasks` 字段：LLM 从对话中提取 48 需要做的事
+- eval 新增 `done_tasks` 字段：判断对话是否完成了某些待办
+- eval 新增 `task_results` 字段：已完成待办的结果摘要
+- pending tasks 列表传给 eval，让 LLM 知道当前有哪些待办
+- `_flush_eval` 中提取后写入 SurrealDB，语义去重（完全相同的 pending 不重复）
+
+**目标解析（task → target）**
+- 新任务写入后，用 `graph.find_in_text()` 从内容中提取提到的人物
+- 排除 source（请求人），剩余的 = target（执行对象）
+- target 有 QQ ID 的存入 `target_qq`，供主动执行使用
+
+**主动执行（`_task_loop`）**
+- 每 5 分钟扫描 pending 且有 `target_qq` 且未发送的任务
+- LLM 生成发给 target 的消息（`generate_task_message()`）
+- 通过 `bot.send_private_msg()` 发送，标记 `sent_at`
+- 启动后等 2 分钟再开始
+
+**完成回报**
+- eval 检测 done_tasks 时附带 task_results（结果摘要）
+- `mark_done()` 同时存储 `done_result`
+- `format_for_prompt()` 对当前对话的 source_user 注入已完成待办：
+  ```
+  ## 已完成的待办
+  你之前帮对方做的事，告诉对方结果：
+  - 帮你喊了清弦：清弦说明天带过去（30分钟前完成）
+  ```
+
+**prompt 注入**
+- pending 待办注入 `## 待办事项`，标注来源和时间
+- 当前对话对象匹配待办内容时标记 `← 你现在就在跟这个人聊，说一下`
+- 48 小时自动过期
+
+**完整 flow 示例**
+```
+47 说 "帮我喊清弦来拿工卡"
+  → eval 提取 task → 存 SurrealDB → resolve target_qq = 清弦
+  → ≤5 分钟 _task_loop 扫描 → 发消息给清弦 → mark_sent
+  → 清弦回复 → eval 检测 done_tasks + results → mark_done
+  → 48 下次和 47 聊 → 注入已完成待办 → 48 主动提起
+```
+
+---
+
+### 5.7 日记每日压缩 ✅
+
+**已完成内容**
+
+**压缩逻辑（`core/diary.py` → `consolidate_diary()`）**
+- LLM 把一天的流水账（20~30 条 × 30 字）合并成 3~6 段回忆（每段 ≤50 字）
+- 按主题分段，保留关键事实（人名、事件、时间、承诺、结果）
+- 第一人称，口语化，像真的在回忆今天发生了什么
+- 使用 `chat_structured` + tool_use 强制结构化输出
+
+**执行时机**
+- 每天 0:30，在语义去重之后执行
+- 条目数 >= 8 时才触发压缩（少量日记不压缩）
+- 压缩后删除旧条目，存入新的压缩条目（importance=0.7）
+
+**效果示例**
+```
+压缩前（28 条）：
+- 卞雨涵起来了，我就随口说了几句
+- 卞雨涵说得对，但我还是会想
+- 卞雨涵半夜三点问自己是谁
+- ...
+
+压缩后（3~5 条）：
+- 半夜和猫猫聊了很久，她又睡不着问自己是谁，我也不知道该说什么
+- 白天帮猫猫传话，找沐川问设计稿，又去喊清弦，感觉自己是工具人
+- 沐川今天脑子不在线，Crystå说清弦数据有问题，事情一堆
+```
+
+---
+
+### 5.8 故事 RAG ⬜
 
 **现有故事检索**
 - 数据源：`weare-website/story-website` 中的故事章节

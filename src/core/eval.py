@@ -31,6 +31,31 @@ _EVAL_TOOL = {
                 "items": {"type": "string"},
                 "description": "从用户发言提取的具体事实，没有则空数组",
             },
+            "aliases": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "对话中出现的对「其他人」的新称呼/别名，格式'别名=真名'。"
+                               "比如用户管沈沐川叫'沈老师'，记录'沈老师=沈沐川'。"
+                               "只记录你认识的人的新别名，不确定的不记。没有则空数组。",
+            },
+            "tasks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "48 需要去做的事。比如'帮47问沐川设计稿'、'喊清弦拿东西'。"
+                               "只记录明确的待办，模糊的不记。已经做完的不算。没有则空数组。",
+            },
+            "done_tasks": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "这段对话完成了哪些待办事项。"
+                               "用关键词描述完成了什么，比如'设计稿'、'喊清弦'。没有则空数组。",
+            },
+            "task_results": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "已完成待办的结果摘要，格式'关键词：对方的回应'，"
+                               "如'喊清弦：清弦说明天带过来'。不超过30字。没有则空数组。",
+            },
         },
         "required": ["importance", "impression", "trust_delta", "facts"],
     },
@@ -66,7 +91,22 @@ trust_delta 标准（整数，从你的角度）：
 
 facts 说明：
 - 只提取用户明确说出的具体事实：地点、职业、学校、爱好、特殊经历等
-- 没有新事实就返回空数组，不要猜测"""
+- 没有新事实就返回空数组，不要猜测
+
+tasks 说明：
+- 48 在对话中承诺要做的事、被拜托的事、自己决定要做的事
+- 只记录可执行的具体事项，不记"想想""考虑"这种模糊的
+- 已经在对话中做完的不算待办
+
+done_tasks 说明：
+- 如果下方有待办事项列表，判断这段对话是否解决了其中某些
+- 用关键词描述即可，不需要完整匹配
+- 没有待办事项列表则返回空数组
+
+task_results 说明：
+- 和 done_tasks 对应，记录对方怎么回应的
+- 格式：关键词：摘要，如"喊清弦：清弦说明天来拿"
+- 没有 done_tasks 则空数组"""
 
 _MIN_TOTAL_LEN = 15  # 短对话跳过阈值
 
@@ -84,19 +124,22 @@ async def evaluate_exchange(
     user_name: str,
     message: str,
     response: str,
-) -> tuple[float, str, float, list[str]]:
+) -> tuple[float, str, float, list[str], list[str], list[str], list[str], list[str]]:
     """单轮评估（向后兼容）。"""
     return await evaluate_batch([(user_name, message, response)])
 
 
 async def evaluate_batch(
     rounds: list[tuple[str, str, str]],
-) -> tuple[float, str, float, list[str]]:
-    """多轮对话综合评估。返回 (importance, impression, trust_delta, facts)。
+    pending_tasks: list[str] | None = None,
+    context: str = "",
+) -> tuple[float, str, float, list[str], list[str], list[str], list[str], list[str]]:
+    """多轮对话综合评估。返回 (importance, impression, trust_delta, facts, aliases, tasks, done_tasks, task_results)。
+    context: 可选的背景信息（对话对象、已知事实、最近发生的事）。
     短对话自动跳过。
     """
     if not rounds:
-        return 0.2, "", 0, []
+        return 0.2, "", 0, [], [], [], [], []
 
     # 过滤掉超短的轮次，但至少保留一轮
     meaningful = [
@@ -106,9 +149,16 @@ async def evaluate_batch(
     if not meaningful:
         total = sum(len(r[1]) + len(r[2]) for r in rounds)
         logger.debug(f"评估跳过 | 全部短对话 ({len(rounds)}轮, {total}字)")
-        return 0.2, "", 0, []
+        return 0.2, "", 0, [], [], [], [], []
 
-    content = _format_rounds(meaningful)
+    # 拼装 user prompt：背景 + 对话 + 待办
+    parts = []
+    if context:
+        parts.append(context)
+    parts.append(_format_rounds(meaningful))
+    if pending_tasks:
+        parts.append("48的待办事项：\n" + "\n".join(f"- {t}" for t in pending_tasks))
+    content = "\n\n".join(parts)
 
     try:
         data = await chat_structured(
@@ -121,8 +171,16 @@ async def evaluate_batch(
         trust_delta = max(-5, min(5, int(data.get("trust_delta", 0))))
         raw_facts = data.get("facts", [])
         facts = [str(f)[:30] for f in raw_facts if f][:5]
-        logger.debug(f"评估完成 | {len(meaningful)}轮 imp={importance:.1f} trust={trust_delta:+d} impression={impression!r}")
-        return importance, impression, trust_delta, facts
+        raw_aliases = data.get("aliases", [])
+        aliases = [str(a) for a in raw_aliases if a and "=" in str(a)][:5]
+        raw_tasks = data.get("tasks", [])
+        tasks = [str(t)[:50] for t in raw_tasks if t][:5]
+        raw_done = data.get("done_tasks", [])
+        done_tasks = [str(d)[:50] for d in raw_done if d][:5]
+        raw_results = data.get("task_results", [])
+        task_results = [str(r)[:60] for r in raw_results if r][:5]
+        logger.debug(f"评估完成 | {len(meaningful)}轮 imp={importance:.1f} trust={trust_delta:+d} impression={impression!r} aliases={aliases} tasks={tasks} done={done_tasks} results={task_results}")
+        return importance, impression, trust_delta, facts, aliases, tasks, done_tasks, task_results
     except Exception as e:
         logger.warning(f"评估失败 | {e}")
-        return 0.5, "", 0, []
+        return 0.5, "", 0, [], [], [], [], []

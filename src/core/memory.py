@@ -186,9 +186,33 @@ class Memory:
         user_id: str | None = None,
         limit: int = 5,
     ) -> list[MemoryEntry]:
-        """检索相关历史记忆，三因子加权重排（相似度×0.6 + 时间×0.2 + 重要性×0.2）。"""
+        """检索相关历史记忆，三因子加权重排（相似度×0.6 + 时间×0.2 + 重要性×0.2）。
+
+        当按 chat/user 范围搜索无结果时，自动 fallback 到全局搜索（跨聊天找相关记忆）。
+        """
         loop = asyncio.get_running_loop()
         vector = await loop.run_in_executor(None, self._embed, query)
+
+        scoped = chat_id is not None or user_id is not None
+        entries = await self._search_with_vector(vector, chat_id, user_id, limit)
+
+        # 全局 fallback：按 chat/user 搜不到时，去掉范围限制再搜一次
+        if not entries and scoped:
+            entries = await self._search_with_vector(vector, None, None, limit)
+            if entries:
+                logger.debug(f"记忆检索 | 范围内无结果，全局 fallback 命中 {len(entries)} 条")
+
+        return entries
+
+    async def _search_with_vector(
+        self,
+        vector: list[float],
+        chat_id: str | None,
+        user_id: str | None,
+        limit: int,
+    ) -> list[MemoryEntry]:
+        """用已有向量执行一次检索 + 重排。"""
+        loop = asyncio.get_running_loop()
 
         must = [FieldCondition(key="record_type", match=MatchValue(value="dialog"))]
         if user_id:
@@ -581,6 +605,91 @@ class Memory:
             f"剩余 {len(all_points) - len(ids_to_delete)} 条"
         )
         return len(ids_to_delete)
+
+    async def consolidate_diary(self, min_entries: int = 8) -> int:
+        """每日日记压缩：把今天的流水账合并成 3~6 段回忆。
+        只在条目数 >= min_entries 时执行。
+        返回删除的旧条目数。
+        """
+        from core.diary import consolidate_diary
+
+        loop = asyncio.get_running_loop()
+        cutoff = time.time() - 24 * 3600  # 最近 24h
+
+        diary_filter = Filter(must=[
+            FieldCondition(key="record_type", match=MatchValue(value="diary")),
+            FieldCondition(key="user_id", match=MatchValue(value="48")),
+            FieldCondition(key="timestamp", range=Range(gte=cutoff)),
+        ])
+
+        # 拉最近 24h 的日记
+        all_points = []
+        offset = None
+        while True:
+            results, next_offset = await loop.run_in_executor(
+                None,
+                lambda o=offset: self._client.scroll(
+                    collection_name=COLLECTION,
+                    scroll_filter=diary_filter,
+                    limit=100,
+                    with_payload=True,
+                    with_vectors=False,
+                    order_by=OrderBy(key="timestamp", direction=Direction.ASC),
+                    offset=o,
+                ),
+            )
+            all_points.extend(results)
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        if len(all_points) < min_entries:
+            logger.debug(f"日记压缩 | 条目不足 {len(all_points)}/{min_entries}，跳过")
+            return 0
+
+        # 提取文本
+        raw_entries = [p.payload.get("message", "") for p in all_points if p.payload.get("message")]
+        if len(raw_entries) < min_entries:
+            return 0
+
+        # LLM 压缩
+        consolidated = await consolidate_diary(raw_entries)
+        if not consolidated:
+            logger.warning("日记压缩 | LLM 返回空，保留原始日记")
+            return 0
+
+        # 删除旧条目
+        old_ids = [p.id for p in all_points]
+        for batch_start in range(0, len(old_ids), 100):
+            batch = old_ids[batch_start:batch_start + 100]
+            await loop.run_in_executor(
+                None,
+                lambda b=batch: self._client.delete(
+                    collection_name=COLLECTION,
+                    points_selector=PointIdsList(points=b),
+                ),
+            )
+
+        # 写入压缩后的条目
+        now = time.time()
+        new_entries = [
+            MemoryEntry(
+                user_id="48",
+                chat_type="private",
+                chat_id="48",
+                user_name="48",
+                message=text,
+                response="",
+                timestamp=now,
+                importance=0.7,  # 压缩后的回忆 importance 偏高
+                record_type="diary",
+            )
+            for text in consolidated
+        ]
+        await self.store_batch(new_entries)
+
+        logger.info(f"日记压缩 | {len(old_ids)} 条 → {len(consolidated)} 条")
+        return len(old_ids)
 
 
 # ── 格式化工具 ──
