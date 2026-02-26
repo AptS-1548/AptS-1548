@@ -42,3 +42,6 @@ class Config(BaseModel):
 
     # SurrealDB 人物图谱
     surrealdb_url: str = "ws://localhost:8000"  # SurrealDB 连接地址
+
+    # 故事 RAG
+    story_search_limit: int = 2   # 故事检索条数

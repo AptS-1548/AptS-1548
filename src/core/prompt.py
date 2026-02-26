@@ -140,17 +140,29 @@ PERSONALITY = """你是蔡颖茵，代号 AptS:1548，别人叫你48。仿生人
 _WEEKDAYS = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
 
 
+def format_stories(entries: list) -> str:
+    """将故事记忆片段格式化为可注入 system prompt 的文本。"""
+    if not entries:
+        return ""
+    lines = []
+    for m in entries:
+        text = m.message[:300].replace("\n", " ")
+        lines.append(f"- {text}")
+    return "## 故事记忆\n你经历过的事，别人问起来你知道细节：\n" + "\n".join(lines)
+
+
 def format_impressions(impressions: list) -> str:
     """将印象列表格式化为可注入 system prompt 的文本"""
     if not impressions:
         return ""
     lines = []
     for m in impressions:
-        delta = (dt.now().date() - dt.fromtimestamp(m.timestamp).date()).days
+        d = dt.fromtimestamp(m.timestamp)
+        delta = (dt.now().date() - d.date()).days
         if delta == 0:
-            t = "今天"
+            t = f"今天 {d.strftime('%H:%M')}"
         elif delta == 1:
-            t = "昨天"
+            t = f"昨天 {d.strftime('%H:%M')}"
         elif delta < 7:
             t = f"{delta}天前"
         else:
@@ -161,8 +173,7 @@ def format_impressions(impressions: list) -> str:
 
 def format_diary(entries: list, show_time: bool = False) -> str:
     """将日记列表格式化为可注入 system prompt 的文本。
-    ≤6天用相对时间，≥7天用具体日期。
-    show_time=True 时显示具体时分（供日程生成使用）。
+    ≤6天用相对时间，≥7天用具体日期。今天/昨天始终带 HH:MM。
     """
     if not entries:
         return ""
@@ -172,9 +183,9 @@ def format_diary(entries: list, show_time: bool = False) -> str:
         d = dt.fromtimestamp(e.timestamp)
         delta = (today - d.date()).days
         if delta == 0:
-            t = f"今天 {d.strftime('%H:%M')}" if show_time else "今天"
+            t = f"今天 {d.strftime('%H:%M')}"
         elif delta == 1:
-            t = f"昨天 {d.strftime('%H:%M')}" if show_time else "昨天"
+            t = f"昨天 {d.strftime('%H:%M')}"
         elif delta < 7:
             t = f"{delta}天前"
         else:
@@ -193,6 +204,7 @@ def build_system_prompt(
     diary_context: str = "",
     schedule_context: str = "",
     task_context: str = "",
+    story_context: str = "",
 ) -> tuple[str, str]:
     """返回 (stable, dynamic) 两段 system prompt。
     stable 部分不变可缓存，dynamic 部分每次不同不缓存。
@@ -212,6 +224,9 @@ def build_system_prompt(
 
     if diary_context:
         dynamic_parts.append(diary_context)
+
+    if story_context:
+        dynamic_parts.append(story_context)
 
     if impression_context:
         dynamic_parts.append(impression_context)
@@ -239,7 +254,8 @@ def build_system_prompt(
         dynamic_parts.append(
             "## 当前场景：群聊\n"
             "社恐模式。保持简短，说完就闭嘴。不要长篇大论。\n"
-            "你能看到群里其他人的发言，格式是「名字：内容」，直接回复就好，不要在你的消息里重复这个格式。"
+            "你能看到群里其他人的发言，格式是「名字：内容」，直接回复就好，不要在你的消息里重复这个格式。\n"
+            "如果你在睡觉、不想理、或者觉得没必要回，回复[不回复]。"
         )
     else:
         dynamic_parts.append(

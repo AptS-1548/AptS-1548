@@ -7,7 +7,7 @@ Phase 1: 基础行为系统      ✅ 完成   ← 注意力、防抖、冷却、
 Phase 2: 长期记忆          ✅ 完成   ← Qdrant 向量存储、检索注入、重启重建
 Phase 3: 记忆进化          ✅ 完成   ← 评估系统、分层印象、事实提取、周期摘要
 Phase 4: 关系系统          ✅ 完成   ← 信任等级、用户画像、敌对机制
-Phase 5: 主动行为          🚧 进行中 ← diary → 日程 → 主动关心 → 图谱 → 待办 → 日记压缩 → 故事RAG
+Phase 5: 主动行为          ✅ 完成   ← diary → 日程 → 主动关心 → 图谱 → 待办 → 日记压缩 → 故事RAG
 Phase 6: 微调专属模型      ⬜ 待开始 ← 训练专属 Qwen 模型替换 Claude API
 ```
 
@@ -445,18 +445,42 @@ task:ulid
 
 ---
 
-### 5.8 故事 RAG ⬜
+### 5.8 故事 RAG ✅
 
-**现有故事检索**
-- 数据源：`weare-website/story-website` 中的故事章节
-- 故事切 chunk 存 Qdrant（`record_type="story"`）
-- 对话涉及 48 经历的具体细节时，检索相关段落补充 context
-- prompt 里写了大事件概要，RAG 补细节（数据塔具体过程、诞生那天的对话等）
+**已完成内容**
 
-**48 自创故事**
-- 高 importance 事件后触发，48 用第一人称写一段完整叙述（几百字）
-- 比 diary（30字快照）更丰富，是她对经历的完整记录
-- 存入 Qdrant 作为 RAG 素材，同时也是 Phase 6 微调的训练数据
+**背景故事导入（`scripts/import_stories.py`）**
+- 数据源：`story-website/data/stories/zh-CN/` 中 1548 视角的章节
+- 12 章 × 按 scene_break 切分 = 52 个场景 chunk
+- 每个 chunk 带元数据头 `【故事名·章节名·日期】`
+- 存入 Qdrant（`record_type="story"`, `chat_type="story"`）
+- 幂等：运行前先清除旧 story 记录再重新导入
+- 文本提取：paragraph/internal_monologue/dialogue/quote/atmosphere
+
+**故事检索（`core/memory.py` → `search_stories()`）**
+- filter: `record_type="story"`，纯靠 similarity × 0.7 + importance × 0.3 排序
+- 硬阈值 score >= 0.55（比 dialog 的 0.5 高，要求更精准）
+- 最多返回 2 条，截取前 300 字注入 prompt
+- 格式化为 `## 故事记忆` 注入 dynamic system prompt
+
+**自创故事（`core/story.py`）**
+- 触发条件：eval importance >= 0.8
+- LLM 以第一人称写 200~500 字完整叙述
+- 比 diary（30字快照）丰富得多，有场景、细节、情绪
+- 存入 Qdrant（`record_type="story"`, `chat_type="narrative"`）
+- 同时也是 Phase 6 微调的训练数据
+
+**集成**
+- `_do_reply` 的 `asyncio.gather` 并行检索故事
+- `build_system_prompt` 新增 `story_context` 参数
+- 位置：diary_context 之后、impression_context 之前
+- `_flush_eval` 末尾触发自创故事（fire-and-forget）
+
+**其他改动**
+- 时间标签统一加 HH:MM：日记/印象/记忆的"今天""昨天"都带具体时分
+- `[不回复]` 扩展到群聊：prompt 和代码两侧都支持
+- thinking 泄露过滤：`core/llm.py` 自动剥除 `<thinking>` 块
+- 发送完成日志：`发送完成 | user=xxx lines=N`
 
 ---
 

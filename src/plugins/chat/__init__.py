@@ -16,7 +16,7 @@ from nonebot.adapters.onebot.v11 import (
 )
 
 from core.llm import chat
-from core.prompt import build_system_prompt, build_group_turns, format_impressions, format_diary
+from core.prompt import build_system_prompt, build_group_turns, format_impressions, format_diary, format_stories
 from core.guard import Guard
 from core.memory import Memory, MemoryEntry, format_memories
 from core.eval import evaluate_exchange, evaluate_batch
@@ -27,6 +27,7 @@ from core.schedule import ensure_schedule, get_willingness, format_schedule_cont
 from core.proactive import check_proactive, check_schedule_proactive, generate_schedule_message, generate_task_message
 from core.graph import CharacterGraph
 from core.task import TaskManager
+from core.story import generate_story
 
 from .config import Config
 
@@ -531,6 +532,27 @@ async def _write_diary_entry(
     logger.debug(f"日记已存 | {entry_text!r}")
 
 
+async def _write_story_entry(
+    user_name: str,
+    rounds: list[dict],
+    response_text: str,
+    importance: float,
+) -> None:
+    """为高 importance 事件生成一段完整叙述并存储。"""
+    messages = "\n".join(f"{user_name}: {r.get('message', '')[:80]}" for r in rounds)
+    resp = response_text[:200] if response_text else ""
+
+    try:
+        diary_entries = await memory.get_diary(recent_limit=3)
+        diary_texts = [e.message for e in diary_entries]
+    except Exception:
+        diary_texts = []
+
+    text = await generate_story(user_name, messages, resp, diary_texts, importance)
+    if text:
+        await memory.store_story(text, importance=importance)
+
+
 async def _evaluate_and_store(
     user_id: str, chat_type: str, chat_id: str,
     user_name: str, message: str, response: str,
@@ -765,6 +787,10 @@ async def _flush_eval(user_id: str):
             user_id, user_name, full_msg, full_resp, importance, relay_names or None,
         ))
 
+    # 高 importance 事件 → 写故事（比 diary 丰富得多的完整叙述）
+    if importance >= 0.8:
+        asyncio.create_task(_write_story_entry(user_name, rounds_info, full_resp, importance))
+
 
 async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool, search_query: str = ""):
     """调用 LLM 并发送回复。search_query 是 burst 期间所有消息的拼合，用于记忆/日记检索；text 是最后一条，用于上下文和发送。"""
@@ -816,18 +842,20 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     # 检索相关历史记忆 + 最近印象 + 48 的近况日记
     # 群聊按群隔离，私聊按人检索（群聊+私聊全捞）
     if is_group:
-        memories, impressions, diary_entries = await asyncio.gather(
+        memories, impressions, diary_entries, story_entries = await asyncio.gather(
             memory.search(query=search_query, chat_id=chat_id, limit=plugin_config.memory_search_limit),
             memory.get_impressions(chat_id=chat_id, recent_limit=plugin_config.impression_recent_limit, key_limit=plugin_config.impression_key_limit),
             memory.get_diary(query=search_query, recent_limit=plugin_config.diary_limit),
+            memory.search_stories(query=search_query, limit=plugin_config.story_search_limit),
         )
     else:
-        memories, impressions, diary_entries = await asyncio.gather(
+        memories, impressions, diary_entries, story_entries = await asyncio.gather(
             memory.search(query=search_query, user_id=user_id, limit=plugin_config.memory_search_limit),
             memory.get_impressions(user_id=user_id, recent_limit=plugin_config.impression_recent_limit, key_limit=plugin_config.impression_key_limit),
             memory.get_diary(query=search_query, recent_limit=plugin_config.diary_limit),
+            memory.search_stories(query=search_query, limit=plugin_config.story_search_limit),
         )
-    logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)} diary={len(diary_entries)}")
+    logger.info(f"[{_tid()}] 记忆检索 | dialog={len(memories)} impression={len(impressions)} diary={len(diary_entries)} story={len(story_entries)}")
 
     # fallback: 短消息向量搜索无结果时，用最近几条兜底
     if not memories:
@@ -841,6 +869,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     memory_context = format_memories(memories)
     impression_context = format_impressions(impressions)
     diary_context = format_diary(diary_entries)
+    story_context = format_stories(story_entries)
 
     await ensure_schedule(diary_context=diary_context)
     schedule_context = format_schedule_context()
@@ -857,6 +886,8 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         logger.debug(f"[{_tid()}] 注入记忆 |\n{memory_context}")
     if impression_context:
         logger.debug(f"[{_tid()}] 注入印象 |\n{impression_context}")
+    if story_context:
+        logger.debug(f"[{_tid()}] 注入故事 |\n{story_context}")
     if task_context:
         logger.debug(f"[{_tid()}] 注入待办 |\n{task_context}")
 
@@ -870,6 +901,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         diary_context=diary_context,
         schedule_context=schedule_context,
         task_context=task_context,
+        story_context=story_context,
     )
 
     if is_group:
@@ -891,10 +923,11 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
 
     logger.info(f"[{_tid()}] LLM ← | user={user_id} len={len(response)} time={elapsed:.1f}s")
 
-    # 私聊：48 可以选择不回复（日程系统驱动）
-    if not is_group and "[不回复]" in response:
+    # 48 可以选择不回复
+    if "[不回复]" in response:
         logger.info(f"[{_tid()}] 48 选择不回复 | user={user_id}")
-        _push_private(user_id, "assistant", "(已读不回)")
+        if not is_group:
+            _push_private(user_id, "assistant", "(已读不回)")
         return
 
     if is_group:
@@ -925,6 +958,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         await _typing_delay(line)
 
     await _send(bot, is_group, group_id, user_id, lines[-1])
+    logger.info(f"[{_tid()}] 发送完成 | user={user_id} lines={len(lines)}")
 
 
 matcher = on_message(priority=99, block=False)

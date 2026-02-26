@@ -89,6 +89,14 @@ async def chat(
             text = text[len(prefix):].strip()
             break
 
+    # 过滤内嵌 thinking 块（部分 proxy 会把 thinking 当文本返回）
+    import re
+    thinking_match = re.search(r'<thinking>.*?</thinking>\s*', text, re.DOTALL)
+    if thinking_match:
+        logger.debug(f"thinking 泄露 | 已过滤 {len(thinking_match.group())} 字符")
+        text = text[:thinking_match.start()] + text[thinking_match.end():]
+        text = text.strip()
+
     return text
 
 

@@ -691,17 +691,95 @@ class Memory:
         logger.info(f"日记压缩 | {len(old_ids)} 条 → {len(consolidated)} 条")
         return len(old_ids)
 
+    # ── 故事检索 / 存储 ──
+
+    async def search_stories(self, query: str, limit: int = 2) -> list[MemoryEntry]:
+        """检索相关的故事片段（背景故事 + 自创叙述）。
+        纯靠 similarity + importance 双因子排序，不做时间 rerank。
+        """
+        loop = asyncio.get_running_loop()
+        vector = await loop.run_in_executor(None, self._embed, query)
+
+        query_filter = Filter(must=[
+            FieldCondition(key="record_type", match=MatchValue(value="story")),
+        ])
+
+        raw_limit = max(limit * 2, 6)
+        try:
+            results = await loop.run_in_executor(
+                None,
+                lambda: self._client.query_points(
+                    collection_name=COLLECTION,
+                    query=vector,
+                    query_filter=query_filter,
+                    limit=raw_limit,
+                    with_payload=True,
+                ).points,
+            )
+        except Exception as e:
+            logger.warning(f"故事检索失败 | {e}")
+            return []
+
+        SCORE_THRESHOLD = 0.55
+
+        scored = []
+        for r in results:
+            if r.score < SCORE_THRESHOLD:
+                continue
+            p = r.payload
+            importance = p.get("importance", 0.8)
+            combined = r.score * 0.7 + importance * 0.3
+            scored.append((combined, p))
+
+        scored.sort(key=lambda x: x[0], reverse=True)
+
+        return [
+            MemoryEntry(
+                user_id=p.get("user_id", "48"),
+                chat_type=p.get("chat_type", "story"),
+                chat_id=p.get("chat_id", ""),
+                user_name=p.get("user_name", "48"),
+                message=p.get("message", ""),
+                response=p.get("response", ""),
+                timestamp=p.get("timestamp", 0.0),
+                importance=p.get("importance", 0.8),
+                record_type="story",
+            )
+            for _, p in scored[:limit]
+        ]
+
+    async def store_story(self, text: str, importance: float = 0.8) -> bool:
+        """存储 48 自创的故事叙述。"""
+        entry = MemoryEntry(
+            user_id="48",
+            chat_type="narrative",
+            chat_id="48",
+            user_name="48",
+            message=text,
+            response="",
+            importance=importance,
+            record_type="story",
+        )
+        try:
+            await self.store(entry)
+            logger.info(f"故事存储 | {len(text)} 字 | importance={importance}")
+            return True
+        except Exception as e:
+            logger.warning(f"故事存储失败 | {e}")
+            return False
+
 
 # ── 格式化工具 ──
 
 def _time_label(timestamp: float) -> str:
-    """时间戳 → 可读标签，按本地自然日计算"""
+    """时间戳 → 可读标签，按本地自然日计算。今天/昨天带 HH:MM。"""
     from datetime import datetime
-    delta = (datetime.now().date() - datetime.fromtimestamp(timestamp).date()).days
+    d = datetime.fromtimestamp(timestamp)
+    delta = (datetime.now().date() - d.date()).days
     if delta == 0:
-        return "今天"
+        return f"今天 {d.strftime('%H:%M')}"
     if delta == 1:
-        return "昨天"
+        return f"昨天 {d.strftime('%H:%M')}"
     if delta < 7:
         return f"{delta}天前"
     return f"{delta // 7}周前"
