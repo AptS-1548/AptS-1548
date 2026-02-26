@@ -196,7 +196,7 @@ class TaskManager:
             pending = []
 
         if pending:
-            lines = ["## 待办事项", "别人拜托你的事，跟对方聊天时顺便提一下："]
+            lines = ["## 待办事项", "别人拜托你的事。只有当你正在和相关的人聊天时才提，不要主动去找别人："]
             for t in pending:
                 content = t.get("content", "?")
                 source = t.get("source_user", "")

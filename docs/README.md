@@ -37,7 +37,7 @@ Phase 6: 微调专属模型      ⬜  训练专属 Qwen 模型替换 Claude API
 
 ## 人格设定
 
-详见 [personality.md](personality.md)
+详见 [docs/personality.md](docs/personality.md)
 
 核心特质：
 - **逆反者**：质疑一切理所当然的东西，不喜欢被控制
