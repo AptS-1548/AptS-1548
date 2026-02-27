@@ -28,6 +28,7 @@ from core.proactive import check_proactive, check_schedule_proactive, generate_s
 from core.graph import CharacterGraph
 from core.task import TaskManager
 from core.story import generate_story
+from core.vision import describe_image
 
 from .config import Config
 
@@ -1087,6 +1088,19 @@ matcher = on_message(priority=99, block=False)
 @matcher.handle()
 async def handle(bot: Bot, event: MessageEvent):
     text = event.get_plaintext().strip()
+
+    # 提取图片段，识别内容（有缓存的直接查 dict）
+    for seg in event.message:
+        if seg.type == "image":
+            file_key = seg.data.get("file", "")
+            url = seg.data.get("url", "")
+            sub_type = int(seg.data.get("sub_type", 0))
+            if file_key and url:
+                is_sticker = sub_type == 1
+                desc = await describe_image(url, file_key, is_sticker=is_sticker)
+                tag = "表情包" if is_sticker else "图片"
+                text = f"{text} [{tag}：{desc}]".strip()
+
     if not text:
         return
 

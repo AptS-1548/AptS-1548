@@ -10,6 +10,7 @@ dependencies = [
     "qdrant-client>=1.7.0",
     "sentence-transformers>=3.0.0",
     "surrealdb>=1.0.0",
+    "httpx>=0.27.0",
 ]
 
 [tool.nonebot]
