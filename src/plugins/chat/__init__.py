@@ -1095,9 +1095,10 @@ async def handle(bot: Bot, event: MessageEvent):
             file_key = seg.data.get("file", "")
             url = seg.data.get("url", "")
             sub_type = int(seg.data.get("sub_type", 0))
+            summary = seg.data.get("summary", "")
             if file_key and url:
                 is_sticker = sub_type == 1
-                desc = await describe_image(url, file_key, is_sticker=is_sticker)
+                desc = await describe_image(url, file_key, is_sticker=is_sticker, summary=summary)
                 tag = "表情包" if is_sticker else "图片"
                 text = f"{text} [{tag}：{desc}]".strip()
 
