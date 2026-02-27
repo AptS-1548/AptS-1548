@@ -170,6 +170,7 @@ async def chat_structured(
     timeout = int(getattr(env, "llm_timeout_sec", LLM_TIMEOUT_SEC))
 
     # ── 第一次：tool_use 方式 ──
+    cached_tool = {**tool, "cache_control": {"type": "ephemeral"}}
     try:
         response = await asyncio.wait_for(
             client.messages.create(
@@ -177,7 +178,7 @@ async def chat_structured(
                 max_tokens=max_tokens,
                 system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
                 messages=messages,
-                tools=[tool],
+                tools=[cached_tool],
                 tool_choice={"type": "tool", "name": tool["name"]},
             ),
             timeout=timeout,

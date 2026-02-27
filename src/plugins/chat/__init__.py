@@ -24,7 +24,7 @@ from core.relationship import RelationshipManager
 from core.summarize import generate_user_summary
 from core.diary import generate_diary_entry
 from core.schedule import ensure_schedule, get_willingness, format_schedule_context, schedule_daily_loop
-from core.proactive import check_proactive, check_schedule_proactive, generate_schedule_message, generate_task_message
+from core.proactive import check_proactive, check_schedule_proactive, generate_schedule_message, generate_task_message, generate_followup_message
 from core.graph import CharacterGraph
 from core.task import TaskManager
 from core.story import generate_story
@@ -96,6 +96,10 @@ RELAY_WINDOW_SEC = 600  # 10 分钟内持续追踪
 
 # ── 印象去重：同一用户/群 2 小时内只存一次印象（运行时 + 持久化通过 relationship）──
 IMPRESSION_COOLDOWN_SEC = 2 * 3600
+
+# ── follow-up：对话跟进（内存存储，不持久化）──
+# user_id -> {context: str, due_at: float, user_name: str}
+_pending_followups: dict[str, dict] = {}
 
 # ── Trace ID（每次 LLM 调用一个，贯穿整条链路）──
 _trace_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
@@ -353,6 +357,22 @@ async def _proactive_loop():
             continue
 
         owner_id = plugin_config.owner_id
+
+        # ── Part 0: 对话跟进 ──
+        now = time.time()
+        for uid in list(_pending_followups):
+            fu = _pending_followups[uid]
+            if now < fu["due_at"]:
+                continue
+            # 到期了
+            del _pending_followups[uid]
+            name = fu["user_name"]
+            try:
+                msg = await generate_followup_message(name, fu["context"])
+                if msg:
+                    await _send_proactive(bot, uid, msg, label=f"跟进→{name}")
+            except Exception as e:
+                logger.warning(f"跟进发送异常 | {name} {e}")
 
         # ── Part 1: 日程驱动 ──
         try:
@@ -762,6 +782,20 @@ async def _flush_eval(user_id: str):
             except Exception as e:
                 logger.debug(f"图谱 | 别名写入跳过: {alias_pair!r} {e}")
 
+    # follow-up：对话跟进（只对 owner 和 friend 生效）
+    if ev.follow_up and ev.follow_up_minutes > 0:
+        rel_level_for_fu = relationship.trust_level(user_id, plugin_config.owner_id)
+        if rel_level_for_fu in ("owner", "friend"):
+            _pending_followups[user_id] = {
+                "context": ev.follow_up,
+                "due_at": time.time() + ev.follow_up_minutes * 60,
+                "user_name": user_name,
+            }
+            logger.info(
+                f"跟进登记 | user={user_name} minutes={ev.follow_up_minutes} "
+                f"context={ev.follow_up!r}"
+            )
+
     impression_key = f"{chat_type}_{chat_id}_{user_id}"
     cooldown_ok = (
         ev.importance >= 0.8
@@ -916,6 +950,9 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
 
     # 检索相关历史记忆 + 最近印象 + 48 的近况日记
     # 群聊按群隔离，私聊按人检索（群聊+私聊全捞）
+    rel_level = relationship.trust_level(user_id, plugin_config.owner_id)
+    allow_global_fallback = rel_level not in ("stranger", "enemy")
+
     if is_group:
         memories, impressions, diary_entries, story_entries = await asyncio.gather(
             memory.search(query=search_query, chat_id=chat_id, limit=plugin_config.memory_search_limit),
@@ -925,7 +962,7 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
         )
     else:
         memories, impressions, diary_entries, story_entries = await asyncio.gather(
-            memory.search(query=search_query, user_id=user_id, limit=plugin_config.memory_search_limit),
+            memory.search(query=search_query, user_id=user_id, limit=plugin_config.memory_search_limit, global_fallback=allow_global_fallback),
             memory.get_impressions(user_id=user_id, recent_limit=plugin_config.impression_recent_limit, key_limit=plugin_config.impression_key_limit),
             memory.get_diary(query=search_query, recent_limit=plugin_config.diary_limit),
             memory.search_stories(query=search_query, limit=plugin_config.story_search_limit),
@@ -952,7 +989,6 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     # 待办事项
     task_context = await task_mgr.format_for_prompt(current_user=user_name, current_qq=user_id)
 
-    rel_level = relationship.trust_level(user_id, plugin_config.owner_id)
     rel_context = relationship.format_context(user_id, user_name, plugin_config.owner_id)
     logger.debug(f"[{_tid()}] 关系 | user={user_name} level={rel_level} trust={relationship.get(user_id).trust:.1f}")
     if diary_context:
@@ -1061,6 +1097,22 @@ async def handle(bot: Bot, event: MessageEvent):
     if isinstance(event, PrivateMessageEvent):
         sender_name = event.sender.nickname or user_id
         logger.info(f"私聊 | {sender_name}({user_id}) {text[:40]!r}")
+
+        # 私聊意愿门控：睡觉/忙时有概率不处理
+        # owner 只有深度睡眠时极小概率不响应，其他人按意愿度判定
+        w = get_willingness()
+        if user_id == plugin_config.owner_id:
+            if w <= 0.1 and random.random() < 0.1:
+                logger.debug(f"私聊跳过 | owner 深度睡眠 willingness={w:.2f}")
+                return
+        elif w < 0.5 and random.random() > max(w, 0.05):
+            logger.debug(f"私聊跳过 | {sender_name}({user_id}) willingness={w:.2f}")
+            return
+
+        # 对方主动发消息了，取消跟进（不需要再追问）
+        if user_id in _pending_followups:
+            logger.debug(f"跟进取消 | user={sender_name} 对方已主动发消息")
+            del _pending_followups[user_id]
     elif is_group:
         group_id = str(event.group_id)
 

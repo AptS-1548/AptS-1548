@@ -185,10 +185,11 @@ class Memory:
         chat_id: str | None = None,
         user_id: str | None = None,
         limit: int = 5,
+        global_fallback: bool = True,
     ) -> list[MemoryEntry]:
         """检索相关历史记忆，三因子加权重排（相似度×0.6 + 时间×0.2 + 重要性×0.2）。
 
-        当按 chat/user 范围搜索无结果时，自动 fallback 到全局搜索（跨聊天找相关记忆）。
+        当按 chat/user 范围搜索无结果时，若 global_fallback=True 则自动 fallback 到全局搜索。
         """
         loop = asyncio.get_running_loop()
         vector = await loop.run_in_executor(None, self._embed, query)
@@ -197,7 +198,7 @@ class Memory:
         entries = await self._search_with_vector(vector, chat_id, user_id, limit)
 
         # 全局 fallback：按 chat/user 搜不到时，去掉范围限制再搜一次
-        if not entries and scoped:
+        if not entries and scoped and global_fallback:
             entries = await self._search_with_vector(vector, None, None, limit)
             if entries:
                 logger.debug(f"记忆检索 | 范围内无结果，全局 fallback 命中 {len(entries)} 条")

@@ -257,6 +257,13 @@ _SYSTEM_TASK = """你是 48。{source}拜托你一件事："{content}"
 像平时在QQ上发消息一样，一条，简短，直接说事。
 不用说"xxx让我跟你说"，直接说事情本身。"""
 
+_SYSTEM_FOLLOWUP = """你是 48。之前{name}跟你说了一件事："{context}"
+现在时间到了，你想问一下进展。
+
+像平时在QQ上发消息一样，一条，简短，自然。
+不要解释你为什么问，就像你一直记着这件事一样。
+一条就够。"""
+
 
 async def generate_task_message(
     content: str,
@@ -283,4 +290,27 @@ async def generate_task_message(
 
     result = result.strip()
     logger.info(f"待办消息 | → {target_name} | task={content!r} msg={result!r}")
+    return result
+
+
+async def generate_followup_message(
+    target_name: str,
+    context: str,
+) -> str | None:
+    """为对话跟进生成一条自然的消息。"""
+    system = _SYSTEM_FOLLOWUP.format(name=target_name, context=context)
+
+    try:
+        result = await chat(
+            system=system,
+            messages=[{"role": "user", "content": f"问一下{target_name}。"}],
+            max_tokens=64,
+            disable_thinking=True,
+        )
+    except Exception as e:
+        logger.warning(f"跟进消息 | {target_name} LLM 失败: {e}")
+        return None
+
+    result = result.strip()
+    logger.info(f"跟进消息 | → {target_name} | context={context!r} msg={result!r}")
     return result

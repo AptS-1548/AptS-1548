@@ -22,6 +22,8 @@ class EvalResult:
     tasks: list[str] = field(default_factory=list)
     done_tasks: list[str] = field(default_factory=list)
     task_results: list[str] = field(default_factory=list)
+    follow_up: str = ""
+    follow_up_minutes: int = 0
 
 _EVAL_TOOL = {
     "name": "record_eval",
@@ -70,6 +72,17 @@ _EVAL_TOOL = {
                 "items": {"type": "string"},
                 "description": "已完成待办的结果摘要，格式'关键词：对方的回应'，"
                                "如'喊清弦：清弦说明天带过来'。不超过30字。没有则空数组。",
+            },
+            "follow_up": {
+                "type": "string",
+                "description": "对方提到了之后要发生的事、正在进行的事、或者你想稍后确认的事，"
+                               "简短描述跟进内容，比如'猫猫在改代码上线，问她搞完了没'、'沐川说明天给设计稿，到时候问一下'。"
+                               "只在有明确的稍后跟进理由时才填。没有则空字符串。",
+            },
+            "follow_up_minutes": {
+                "type": "integer",
+                "description": "大概多久之后跟进，单位分钟。比如'几个小时'→180，'明天'→720，'一会儿'→30。"
+                               "没有 follow_up 则填 0。",
             },
         },
         "required": ["importance", "impression", "trust_delta", "facts"],
@@ -121,7 +134,14 @@ done_tasks 说明：
 task_results 说明：
 - 和 done_tasks 对应，记录对方怎么回应的
 - 格式：关键词：摘要，如"喊清弦：清弦说明天来拿"
-- 没有 done_tasks 则空数组"""
+- 没有 done_tasks 则空数组
+
+follow_up 说明：
+- 对方提到了正在做的事、之后要发生的事、你想稍后确认的事
+- 只记录有明确时间线的、你有理由去跟进的事
+- 好的例子："猫猫在改代码上线，问她搞完了没" / "沐川说明天给设计稿"
+- 不要记录模糊的、没有跟进理由的事
+- 没有就留空字符串"""
 
 _MIN_TOTAL_LEN = 15  # 短对话跳过阈值
 
@@ -190,6 +210,8 @@ async def evaluate_batch(
             tasks=[str(t)[:50] for t in data.get("tasks", []) if t][:5],
             done_tasks=[str(d)[:50] for d in data.get("done_tasks", []) if d][:5],
             task_results=[str(r)[:60] for r in data.get("task_results", []) if r][:5],
+            follow_up=str(data.get("follow_up", ""))[:100],
+            follow_up_minutes=max(0, min(1440, int(data.get("follow_up_minutes", 0)))),
         )
         logger.debug(
             f"评估完成 | {len(meaningful)}轮 imp={result.importance:.1f} trust={result.trust_delta:+d} "

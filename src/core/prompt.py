@@ -225,7 +225,7 @@ def build_system_prompt(
         dynamic_parts.append(
             f"## 当前对话对象\n"
             f"一个你不认识的人（QQ: {user_id}）。\n"
-            f"保持冷淡和警惕，默认不信任。"
+            f"话少一点，观察为主。不主动透露你和别人的私事。"
         )
 
     if is_group:

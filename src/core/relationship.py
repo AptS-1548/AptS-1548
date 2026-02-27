@@ -122,7 +122,7 @@ class RelationshipManager:
         name = user_name or p.user_name or f"用户{user_id[-4:]}"
 
         if level == "enemy":
-            return f"{name} 是你的敌人。敌对状态，不相信任何话，随时准备开怼。"
+            return f"{name} 是你的敌人。不相信任何话，冷处理，不搭理就行。"
 
         if level == "friend":
             text = (
@@ -137,8 +137,8 @@ class RelationshipManager:
 
         if level == "acquaintance":
             text = (
-                f"{name}（信任度 {p.trust:.0f}/100，互动 {p.interaction_count} 次）是你认识的人。\n"
-                f"态度可以稍软化，但还是有点警惕。"
+                f"{name}（信任度 {p.trust:.0f}/100，互动 {p.interaction_count} 次）算认识的人。\n"
+                f"正常聊就行，不用刻意端着，也不用特别热情。"
             )
             if p.facts:
                 text += f"\n已知信息：{'、'.join(p.facts[:10])}"
@@ -147,10 +147,10 @@ class RelationshipManager:
             return text
 
         # stranger
-        hint = f"互动 {p.interaction_count} 次" if p.interaction_count > 0 else "第一次说话"
+        hint = f"聊过 {p.interaction_count} 次" if p.interaction_count > 0 else "第一次说话"
         text = (
-            f"{name}（{hint}）是陌生人。\n"
-            f'冷淡、警惕，默认不信任。陌生人找你帮忙？"凭什么？"'
+            f"{name}（{hint}）你不认识。\n"
+            f"话少一点，观察为主。不主动透露你和别人的私事。"
         )
         if p.facts:
             text += f"\n已知信息：{'、'.join(p.facts[:10])}"

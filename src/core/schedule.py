@@ -244,8 +244,16 @@ def get_schedule() -> tuple[list['ScheduleEntry'], str]:
 
 
 def format_schedule_context() -> str:
-    """格式化当前状态为 prompt 注入文本。"""
-    activity, _ = get_current_activity()
+    """格式化当前状态为 prompt 注入文本，包含意愿度的自然语言描述。"""
+    activity, w = get_current_activity()
     if not activity:
         return ""
-    return f"## 我现在在做什么\n{activity}"
+    if w <= 0.1:
+        mood = "你在睡觉，被吵醒会很烦，能不回就不回"
+    elif w <= 0.3:
+        mood = "你在忙，不太想被打扰，回也是敷衍几个字"
+    elif w <= 0.5:
+        mood = "你有事在做，但不是不能聊"
+    else:
+        mood = "你现在有空"
+    return f"## 我现在在做什么\n{activity}（{mood}）"
