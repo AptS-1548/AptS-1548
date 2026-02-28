@@ -7,6 +7,8 @@ WORKDIR /app
 COPY src/pyproject.toml src/uv.lock ./
 
 ENV UV_PYTHON_PREFERENCE=only-system
+# CPU-only PyTorch（~200MB 替代 ~900MB 的 CUDA 版）
+ENV UV_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cpu
 RUN uv sync --frozen --no-install-project --no-dev
 
 # ── Stage 2: 预下载 embedding 模型 ──
