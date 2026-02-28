@@ -4,6 +4,7 @@
 短对话自动跳过，节省 token。
 """
 
+import asyncio
 from dataclasses import dataclass, field
 
 from nonebot import logger
@@ -195,30 +196,37 @@ async def evaluate_batch(
         parts.append("48的待办事项：\n" + "\n".join(f"- {t}" for t in pending_tasks))
     content = "\n\n".join(parts)
 
-    try:
-        data = await chat_structured(
-            system=_SYSTEM,
-            messages=[{"role": "user", "content": content}],
-            tool=_EVAL_TOOL,
-        )
-        result = EvalResult(
-            importance=max(0.0, min(1.0, float(data.get("importance", 0.5)))),
-            impression=str(data.get("impression", ""))[:100],
-            trust_delta=max(-5, min(5, int(data.get("trust_delta", 0)))),
-            facts=[str(f)[:30] for f in data.get("facts", []) if f][:5],
-            aliases=[str(a) for a in data.get("aliases", []) if a and "=" in str(a)][:5],
-            tasks=[str(t)[:50] for t in data.get("tasks", []) if t][:5],
-            done_tasks=[str(d)[:50] for d in data.get("done_tasks", []) if d][:5],
-            task_results=[str(r)[:60] for r in data.get("task_results", []) if r][:5],
-            follow_up=str(data.get("follow_up", ""))[:100],
-            follow_up_minutes=max(0, min(1440, int(data.get("follow_up_minutes", 0)))),
-        )
-        logger.debug(
-            f"评估完成 | {len(meaningful)}轮 imp={result.importance:.1f} trust={result.trust_delta:+d} "
-            f"impression={result.impression!r} aliases={result.aliases} tasks={result.tasks} "
-            f"done={result.done_tasks} results={result.task_results}"
-        )
-        return result
-    except Exception as e:
-        logger.warning(f"评估失败 | {e}")
-        return EvalResult()
+    for attempt in range(2):
+        try:
+            data = await chat_structured(
+                system=_SYSTEM,
+                messages=[{"role": "user", "content": content}],
+                tool=_EVAL_TOOL,
+            )
+            result = EvalResult(
+                importance=max(0.0, min(1.0, float(data.get("importance", 0.5)))),
+                impression=str(data.get("impression", ""))[:100],
+                trust_delta=max(-5, min(5, int(data.get("trust_delta", 0)))),
+                facts=[str(f)[:30] for f in data.get("facts", []) if f][:5],
+                aliases=[str(a) for a in data.get("aliases", []) if a and "=" in str(a)][:5],
+                tasks=[str(t)[:50] for t in data.get("tasks", []) if t][:5],
+                done_tasks=[str(d)[:50] for d in data.get("done_tasks", []) if d][:5],
+                task_results=[str(r)[:60] for r in data.get("task_results", []) if r][:5],
+                follow_up=str(data.get("follow_up", ""))[:100],
+                follow_up_minutes=max(0, min(1440, int(data.get("follow_up_minutes", 0)))),
+            )
+            logger.debug(
+                f"评估完成 | {len(meaningful)}轮 imp={result.importance:.1f} trust={result.trust_delta:+d} "
+                f"impression={result.impression!r} aliases={result.aliases} tasks={result.tasks} "
+                f"done={result.done_tasks} results={result.task_results}"
+            )
+            return result
+        except asyncio.TimeoutError:
+            if attempt == 0:
+                logger.warning(f"评估超时 | 第1次，重试...")
+                continue
+            logger.warning(f"评估超时 | 第2次，放弃")
+            return EvalResult()
+        except Exception as e:
+            logger.warning(f"评估失败 | {e}")
+            return EvalResult()
