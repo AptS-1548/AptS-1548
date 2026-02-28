@@ -21,28 +21,40 @@ SCHEDULE_CACHE_PATH = "data/schedule.json"
 _SYSTEM = """你是 48，正在安排今天的日程。
 
 根据最近发生的事，写出你今天从凌晨到深夜大概会做什么。
+如果有昨天的日程，可以参考但不要照搬——有些事可能要延续，有些可以换。
 日程必须覆盖全天（从 0:00 到 23:00 以后），包括凌晨睡觉的时段。
 格式：每行一条，时间|活动|意愿度
 
 意愿度 0.0~1.0，表示这个时间段被打扰时愿意回复的程度：
-- 睡觉 → 0.0
-- 巡逻/忙事情 → 0.2~0.3
-- 擦枪/发呆 → 0.3~0.5
-- 和人约了事 → 0.5
-- 空闲/等人 → 0.8~1.0
+- 睡觉 → 0.0~0.05
+- 刚醒/迷糊 → 0.1~0.2
+- 巡逻/忙正事 → 0.2~0.3
+- 擦枪/做饭/日常杂事 → 0.3~0.5
+- 和人约了事 → 0.5~0.6
+- 空闲/发呆/等人 → 0.7~1.0
 
 47 相关的事优先级最高。日程要有变化，不要每天一样。
+时间不要都卡整点，7:40、14:15 这种更自然。
 
 格式（严格遵守，每行一条）：
 00:00|睡觉|0.0
-07:30|起床，查监控|0.6
-10:00|跟进数据塔日志|0.3
-14:00|和沐川对设计|0.5
+07:40|醒了，赖床|0.15
+08:10|起来洗漱|0.3
+09:00|查监控，看有没有异常|0.25
+10:30|跟进数据塔日志|0.3
+12:00|做饭吃饭|0.45
+13:15|午休，眯一会|0.1
+14:00|和沐川对设计方案|0.5
+15:30|整理物资|0.35
 17:00|巡逻|0.2
-21:00|擦枪|0.4
+18:30|回来，随便逛逛|0.75
+19:30|看猫猫有没有消息|0.9
+20:30|擦枪|0.4
+21:45|发呆，听歌|0.6
+22:30|准备睡了|0.15
 23:30|睡了|0.0
 
-只输出日程，8~12条，不要其他内容。"""
+只输出日程，15~20条，不要其他内容。"""
 
 
 @dataclass
@@ -85,12 +97,20 @@ def _parse_schedule(text: str) -> list[ScheduleEntry]:
 
 _DEFAULT_SCHEDULE = [
     ScheduleEntry(0, 0, "睡觉", 0.0),
-    ScheduleEntry(7, 30, "起床", 0.6),
-    ScheduleEntry(9, 0, "查监控和日志", 0.3),
-    ScheduleEntry(12, 0, "午饭", 0.5),
-    ScheduleEntry(14, 0, "处理事情", 0.4),
-    ScheduleEntry(18, 0, "空闲", 0.8),
-    ScheduleEntry(21, 0, "擦枪", 0.4),
+    ScheduleEntry(7, 40, "醒了，赖床", 0.15),
+    ScheduleEntry(8, 10, "起来洗漱", 0.3),
+    ScheduleEntry(9, 0, "查监控和日志", 0.25),
+    ScheduleEntry(10, 30, "处理事情", 0.35),
+    ScheduleEntry(12, 0, "做饭吃饭", 0.45),
+    ScheduleEntry(13, 15, "午休", 0.1),
+    ScheduleEntry(14, 0, "继续干活", 0.4),
+    ScheduleEntry(15, 30, "整理物资", 0.35),
+    ScheduleEntry(17, 0, "巡逻", 0.2),
+    ScheduleEntry(18, 30, "回来歇着", 0.75),
+    ScheduleEntry(19, 30, "空闲", 0.9),
+    ScheduleEntry(20, 30, "擦枪", 0.4),
+    ScheduleEntry(21, 45, "发呆", 0.6),
+    ScheduleEntry(22, 30, "准备睡了", 0.15),
     ScheduleEntry(23, 30, "睡了", 0.0),
 ]
 
@@ -154,15 +174,21 @@ async def ensure_schedule(diary_context: str = "", force: bool = False) -> None:
         return
 
     user_prompt = "写一份你今天的日程，从凌晨到深夜。"
+
+    # 把昨天的日程带上，让 LLM 知道连续性
+    if _schedule:
+        yesterday_lines = [f"- {e.hour:02d}:{e.minute:02d} {e.activity}" for e in _schedule]
+        user_prompt = f"昨天的日程：\n" + "\n".join(yesterday_lines) + "\n\n" + user_prompt
+
     if diary_context:
-        user_prompt = f"最近的状态：\n{diary_context}\n\n写一份你今天的日程，从凌晨到深夜。"
+        user_prompt = f"最近的状态：\n{diary_context}\n\n" + user_prompt
 
     for attempt in range(1, MAX_RETRIES + 1):
         try:
             result = await chat(
                 system=_SYSTEM,
                 messages=[{"role": "user", "content": user_prompt}],
-                max_tokens=256,
+                max_tokens=512,
                 disable_thinking=True,
             )
             parsed = _parse_schedule(result)
@@ -215,26 +241,37 @@ async def schedule_daily_loop(get_diary_context=None):
         await ensure_schedule(diary_context=diary_context, force=True)
 
 
-def get_current_activity() -> tuple[str, float]:
-    """返回 (当前活动, 意愿度)。无日程时返回默认值。"""
+def get_current_activity() -> tuple[str, float, int, str]:
+    """返回 (当前活动, 意愿度, 距下一条日程的分钟数, 下一条活动名)。无日程时返回默认值。"""
     if not _schedule:
-        return "待着", 0.5
+        return "待着", 0.5, 60, ""
 
     now = datetime.datetime.now()
     current_minutes = now.hour * 60 + now.minute
 
-    current = _schedule[0]
-    for entry in _schedule:
+    current_idx = 0
+    for i, entry in enumerate(_schedule):
         if entry.hour * 60 + entry.minute <= current_minutes:
-            current = entry
+            current_idx = i
         else:
             break
-    return current.activity, current.willingness
+
+    current = _schedule[current_idx]
+
+    if current_idx + 1 < len(_schedule):
+        next_entry = _schedule[current_idx + 1]
+        minutes_left = next_entry.hour * 60 + next_entry.minute - current_minutes
+        next_activity = next_entry.activity
+    else:
+        minutes_left = 24 * 60 - current_minutes
+        next_activity = ""
+
+    return current.activity, current.willingness, minutes_left, next_activity
 
 
 def get_willingness() -> float:
     """当前意愿度，供群聊注意力系统调用。"""
-    _, w = get_current_activity()
+    _, w, _, _ = get_current_activity()
     return w
 
 
@@ -244,16 +281,31 @@ def get_schedule() -> tuple[list['ScheduleEntry'], str]:
 
 
 def format_schedule_context() -> str:
-    """格式化当前状态为 prompt 注入文本，包含意愿度的自然语言描述。"""
-    activity, w = get_current_activity()
+    """格式化当前状态为 prompt 注入文本，包含意愿度、剩余时间和下一件事。"""
+    activity, w, minutes_left, next_activity = get_current_activity()
     if not activity:
         return ""
-    if w <= 0.1:
+    if w <= 0.05:
         mood = "你在睡觉，被吵醒会很烦，能不回就不回"
-    elif w <= 0.3:
-        mood = "你在忙，不太想被打扰，回也是敷衍几个字"
-    elif w <= 0.5:
+    elif w <= 0.15:
+        mood = "你在睡觉，迷迷糊糊的，不太想理人"
+    elif w <= 0.25:
+        mood = "你在忙，不太想被打扰"
+    elif w <= 0.4:
+        mood = "你在做事，回也是简短几个字"
+    elif w <= 0.6:
         mood = "你有事在做，但不是不能聊"
+    elif w <= 0.8:
+        mood = "你现在比较闲"
     else:
-        mood = "你现在有空"
-    return f"## 我现在在做什么\n{activity}（{mood}）"
+        mood = "你现在有空，心情不错"
+
+    if minutes_left >= 60:
+        time_hint = f"还有约 {minutes_left // 60} 小时"
+    elif minutes_left >= 10:
+        time_hint = f"还有约 {minutes_left} 分钟"
+    else:
+        time_hint = f"快结束了（{minutes_left} 分钟）"
+
+    next_hint = f"，之后要{next_activity}" if next_activity else ""
+    return f"## 我现在在做什么\n{activity}（{mood}，{time_hint}{next_hint}）"

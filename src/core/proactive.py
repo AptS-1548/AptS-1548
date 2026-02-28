@@ -62,19 +62,27 @@ _SYSTEM_SCHEDULE = """你是 48。你的日程上写了现在要"{activity}"。
 
 # ── 全局状态 ──
 _last_proactive: dict[str, float] = {}  # user_id -> 上次主动时间
-_proactive_count_today: int = 0
-_proactive_date: str = ""
+_proactive_timestamps: list[float] = []  # 所有主动消息的时间戳（滚动窗口）
 _triggered_entries: set[str] = set()  # "2025-01-01_14:00" 已触发的日程条目
+_triggered_date: str = ""  # 日程触发记录的日期（跨天清空）
 
 
-def _reset_daily():
-    """跨天重置。"""
-    global _proactive_count_today, _proactive_date, _triggered_entries
+def _count_recent_proactive(window_hours: float = 24.0) -> int:
+    """统计滚动窗口内的主动消息次数。"""
+    cutoff = time.time() - window_hours * 3600
+    # 顺便清理过期记录
+    while _proactive_timestamps and _proactive_timestamps[0] < cutoff:
+        _proactive_timestamps.pop(0)
+    return len(_proactive_timestamps)
+
+
+def _reset_triggered():
+    """跨天清空日程触发记录。"""
+    global _triggered_date
     today = datetime.date.today().isoformat()
-    if _proactive_date != today:
-        _proactive_count_today = 0
+    if _triggered_date != today:
         _triggered_entries.clear()
-        _proactive_date = today
+        _triggered_date = today
 
 
 async def check_proactive(
@@ -91,12 +99,10 @@ async def check_proactive(
     硬性门槛：
     1. 日程意愿度 >= 0.3
     2. 该用户的冷却期
-    3. 今日总次数未超限
+    3. 24h 滚动窗口内次数未超限
     4. 至少 N 小时没聊过
     """
-    global _proactive_count_today
-
-    _reset_daily()
+    _reset_triggered()
 
     is_owner = target_id == owner_id
     target = relationship.get(target_id)
@@ -117,9 +123,10 @@ async def check_proactive(
         logger.debug(f"主动检查 | {label} 跳过：冷却中 {since_last:.0f}s < {user_cooldown}s")
         return None
 
-    # 门槛 3：每日上限
-    if _proactive_count_today >= max_daily:
-        logger.debug(f"主动检查 | {label} 跳过：今日已主动 {_proactive_count_today}/{max_daily} 次")
+    # 门槛 3：滚动窗口上限
+    recent_count = _count_recent_proactive()
+    if recent_count >= max_daily:
+        logger.debug(f"主动检查 | {label} 跳过：24h内已主动 {recent_count}/{max_daily} 次")
         return None
 
     # 门槛 4：沉默时长（last_interaction=0 表示从未记录，视为很久没聊）
@@ -134,7 +141,7 @@ async def check_proactive(
     logger.info(f"主动检查 | {label} 通过所有门槛 | willingness={willingness:.2f} silence={silence_hours:.1f}h last_interaction={target.last_interaction:.0f} → 调用 LLM")
 
     # ── 收集上下文 ──
-    activity, _ = get_current_activity()
+    activity, _, _, _ = get_current_activity()
     diary_entries = await memory.get_diary(recent_limit=5)
     impressions = await memory.get_impressions(user_id=target_id, recent_limit=3, key_limit=2)
 
@@ -176,7 +183,7 @@ async def check_proactive(
         return None
 
     _last_proactive[target_id] = time.time()
-    _proactive_count_today += 1
+    _proactive_timestamps.append(time.time())
     logger.info(f"主动检查 | → {name} | silence={silence_hours:.1f}h msg={result!r}")
     return result
 
@@ -192,7 +199,7 @@ async def check_schedule_proactive(
     """
     schedule, schedule_date = get_schedule()
 
-    _reset_daily()
+    _reset_triggered()
 
     if not schedule:
         return []

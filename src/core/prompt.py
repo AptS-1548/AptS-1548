@@ -191,7 +191,7 @@ def build_system_prompt(
 
     # ── 动态部分 ──
     dynamic_parts = [
-        f"## 当前时间\n{now.strftime('%Y-%m-%d %H:00')} {_WEEKDAYS[now.weekday()]}"
+        f"## 当前时间\n{now.strftime('%Y-%m-%d %H:%M')} {_WEEKDAYS[now.weekday()]}"
     ]
 
     if schedule_context:

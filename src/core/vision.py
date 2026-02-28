@@ -94,9 +94,9 @@ async def describe_image(url: str, file_key: str, is_sticker: bool = False, summ
     model = getattr(env, "claude_model", "claude-sonnet-4-6")
 
     if is_sticker:
-        prompt = "用中文简短描述这个表情包/贴图的意思和情绪，10字以内，只输出描述"
+        prompt = "用中文简短描述这个表情包/贴图的意思和情绪，10字以内，只输出描述。如果看不到图片，只回复：[无图片]"
     else:
-        prompt = "用中文简短描述这张图片的内容，20字以内，只输出描述"
+        prompt = "用中文简短描述这张图片的内容，20字以内，只输出描述。如果看不到图片，只回复：[无图片]"
 
     try:
         response = await asyncio.wait_for(
@@ -118,6 +118,12 @@ async def describe_image(url: str, file_key: str, is_sticker: bool = False, summ
         )
         _notify_api_call()
         desc = response.content[0].text.strip()
+
+        # 检测无效响应（模型看不到图片）
+        if "[无图片]" in desc or "请提供图片" in desc or "无法看到" in desc:
+            logger.warning(f"图片识别 | {file_key[:16]}… 模型未收到图片，使用 fallback")
+            _fail_ts[file_key] = time.time()
+            return fallback
     except Exception as e:
         logger.warning(f"图片识别失败 | {file_key[:16]}…: {type(e).__name__}: {e}")
         _fail_ts[file_key] = time.time()

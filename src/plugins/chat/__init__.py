@@ -62,19 +62,26 @@ _group_context: dict[str, list[dict]] = defaultdict(list)
 MAX_GROUP_CONTEXT = 50
 
 # ── 群聊注意力系统 ──
-_group_attention: dict[str, float] = defaultdict(float)  # group_id -> 0.0~1.0
+# 以日程意愿度为基底，事件因素作为倍率
 _group_last_msg_time: dict[str, float] = {}
 _group_last_reply_time: dict[str, float] = {}
 _group_msg_times: dict[str, deque] = defaultdict(lambda: deque(maxlen=30))
 
-ATTENTION_DECAY = 0.7
-ATTENTION_IDLE_SEC = 300
-ATTENTION_AT = 1.0
-ATTENTION_OWNER = 0.2
-ATTENTION_REPLY_BOOST = 0.2
-ATTENTION_QUOTED = 0.5
+# 参与感：距离上次回复的时间 → 倍率
+ENGAGEMENT_HOT_SEC = 120       # 2 分钟内：正在聊，热乎着
+ENGAGEMENT_HOT_MULT = 1.5
+ENGAGEMENT_WARM_SEC = 300      # 5 分钟内：还在看
+ENGAGEMENT_WARM_MULT = 1.2
+ENGAGEMENT_FADE_SEC = 600      # 10 分钟内：可能还瞟一眼
+ENGAGEMENT_FADE_MULT = 1.0
+ENGAGEMENT_COLD_MULT = 0.7     # 超过 10 分钟：已经不在了
 
-REPLY_COOLDOWN_SEC = 30   # 回复后沉默 30 秒（被@除外）
+# 触发倍率
+TRIGGER_OWNER = 1.5            # owner 说话
+TRIGGER_QUOTED = 3.0           # 引用了我
+
+# 回复冷却：概率衰减，不是硬墙
+REPLY_COOLDOWN_SEC = 45   # 冷却窗口（概率从 0 渐增到 1）
 DENSITY_WINDOW_SEC = 20   # 密度检测窗口
 DENSITY_THRESHOLD = 6     # 20 秒内超过 6 条算太吵
 DENSITY_MULT_MIN = 0.2    # 再吵也最多压到 0.2 倍
@@ -102,6 +109,32 @@ IMPRESSION_COOLDOWN_SEC = 2 * 3600
 # user_id -> {context: str, due_at: float, user_name: str}
 _pending_followups: dict[str, dict] = {}
 
+# ── 延迟回复：看到了但等会再回（私聊专用）──
+_delayed_reply_tasks: dict[str, asyncio.Task] = {}  # user_id -> Task
+
+
+def _should_delay_reply(user_id: str, text: str, is_owner: bool) -> float | None:
+    """决定是否延迟回复。返回延迟秒数，或 None 表示立即回复。仅私聊。"""
+    if is_owner:
+        return None
+
+    w = get_willingness()
+    # 只在中间意愿度区间：太低直接不回，太高没理由拖
+    if w <= 0.15 or w >= 0.5:
+        return None
+
+    # 短消息或有急事信号 → 不延迟
+    if len(text) <= 3 or any(k in text for k in ("急", "在吗", "快", "帮忙", "救", "？")):
+        return None
+
+    # 概率：w 越低越可能延迟（w=0.2 → 18%, w=0.3 → 12%, w=0.4 → 6%）
+    delay_chance = (0.5 - w) * 0.6
+    if random.random() > delay_chance:
+        return None
+
+    # 延迟 3~8 分钟
+    return random.uniform(180, 480)
+
 # ── Trace ID（每次 LLM 调用一个，贯穿整条链路）──
 _trace_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("trace_id", default="-")
 
@@ -112,44 +145,49 @@ def _tid() -> str:
 
 def _new_tid() -> str:
     return format(random.randint(0, 0xFFFFFF), "06x")
-DEBOUNCE_SEC = 1.5
-BURST_COOLDOWN_SEC = 3.0  # 被取消后的冷静期，等用户说完
+DEBOUNCE_BASE = 1.5       # 防抖基准
+BURST_COOLDOWN_BASE = 3.0  # burst 冷静期基准
 
 # ── 后台任务追踪（graceful shutdown 用）──
 _background_tasks: list[asyncio.Task] = []
 
 
-def _update_attention(group_id: str, event: GroupMessageEvent, bot_id: str) -> float:
+def _calc_attention(group_id: str, event: GroupMessageEvent, bot_id: str) -> float:
+    """计算当前群聊注意力：schedule × 参与感 × 触发倍率 × 密度。
+
+    被 @ 直接返回 1.0（除非在睡觉）。
+    """
     now = time.time()
-    att = _group_attention[group_id]
-
-    last_msg = _group_last_msg_time.get(group_id, 0)
-    if now - last_msg > ATTENTION_IDLE_SEC:
-        att = 0.0
-
     _group_last_msg_time[group_id] = now
 
+    base = get_willingness()
+
+    # 被 @ → 直接高注意力（睡觉时保留极低概率）
     if event.is_tome():
-        att = ATTENTION_AT
-        _group_attention[group_id] = att
-        logger.debug(f"注意力 | {group_id} @我 → {att:.2f}")
+        att = max(base, 0.15)
+        logger.debug(f"注意力 | {group_id} @我 base={base:.2f} → {att:.2f}")
         return att
 
-    att *= ATTENTION_DECAY
+    # 参与感：距离上次回复多久
+    since_reply = now - _group_last_reply_time.get(group_id, 0)
+    if since_reply < ENGAGEMENT_HOT_SEC:
+        engagement = ENGAGEMENT_HOT_MULT
+    elif since_reply < ENGAGEMENT_WARM_SEC:
+        engagement = ENGAGEMENT_WARM_MULT
+    elif since_reply < ENGAGEMENT_FADE_SEC:
+        engagement = ENGAGEMENT_FADE_MULT
+    else:
+        engagement = ENGAGEMENT_COLD_MULT
 
-    user_id = str(event.user_id)
-    if user_id == plugin_config.owner_id:
-        att += ATTENTION_OWNER
+    # 触发倍率
+    trigger = 1.0
+    if str(event.user_id) == plugin_config.owner_id:
+        trigger *= TRIGGER_OWNER
     if _is_reply_to_me(event, bot_id):
-        att += ATTENTION_QUOTED
+        trigger *= TRIGGER_QUOTED
 
-    last_reply = _group_last_reply_time.get(group_id, 0)
-    if now - last_reply < ATTENTION_IDLE_SEC:
-        att += ATTENTION_REPLY_BOOST
-
-    att = max(0.0, min(att, 1.0))
-    _group_attention[group_id] = att
-    logger.debug(f"注意力 | {group_id} att={att:.2f}")
+    att = min(base * engagement * trigger, 1.0)
+    logger.debug(f"注意力 | {group_id} base={base:.2f} eng={engagement:.1f} trig={trigger:.1f} → {att:.2f}")
     return att
 
 
@@ -177,33 +215,13 @@ def _density_multiplier(group_id: str) -> float:
     return max(DENSITY_MULT_MIN, 1.0 - excess * 0.1)
 
 
-def _time_multiplier() -> float:
-    """从日程系统获取当前意愿度，替代硬编码时段表。"""
-    w = get_willingness()
-    if w > 0:
-        return w
-    return 0.05  # 睡觉时保留极低概率（被@仍会回）
-
-
-def _should_reply_group(att: float) -> bool:
-    if att >= 0.99:  # 被@，无视时段
+def _should_reply_group(att: float, is_at: bool) -> bool:
+    """根据注意力值决定是否回复。att 已经包含了日程×参与感×触发倍率。"""
+    if is_at:
         return True
-    effective = att * _time_multiplier()
-    if effective <= 0.05:
+    if att <= 0.05:
         return False
-    return random.random() < effective
-
-
-async def _attention_decay_loop():
-    """后台定时衰减，让注意力随时间自然降低"""
-    while True:
-        await asyncio.sleep(30)
-        for group_id in list(_group_attention.keys()):
-            if _group_attention[group_id] > 0.01:
-                _group_attention[group_id] *= 0.85
-                logger.debug(f"注意力衰减 | {group_id} att={_group_attention[group_id]:.2f}")
-            else:
-                _group_attention[group_id] = 0.0
+    return random.random() < att
 
 
 driver = get_driver()
@@ -215,7 +233,6 @@ async def _startup():
     set_api_call_hook(guard.record_api_call)
 
     _background_tasks.extend([
-        asyncio.create_task(_attention_decay_loop()),
         asyncio.create_task(_rebuild_context()),
         asyncio.create_task(memory.cleanup_old_entries()),
         asyncio.create_task(_init_schedule()),
@@ -271,7 +288,7 @@ async def _get_diary_context() -> str:
 
 
 async def _init_schedule():
-    """启动时拉取日记，生成今天的日程。"""
+    """启动时生成今天的日程。有缓存直接用，没有才调 LLM。"""
     await asyncio.sleep(10)
     logger.info("启动日程初始化...")
     try:
@@ -280,13 +297,10 @@ async def _init_schedule():
             key_limit=plugin_config.schedule_diary_key_limit,
         )
         diary_context = format_diary(diary_entries, show_time=True) if diary_entries else ""
-        logger.info(f"日程初始化 | 拉取 {len(diary_entries)} 条日记")
-        if diary_context:
-            logger.info(f"日程初始化 | 日记内容:\n{diary_context}")
     except Exception as e:
         logger.warning(f"日程初始化 | 日记获取失败: {e}")
         diary_context = ""
-    await ensure_schedule(diary_context=diary_context, force=True)
+    await ensure_schedule(diary_context=diary_context)
 
 
 async def _send_proactive(bot: Bot, target_id: str, msg: str, label: str = ""):
@@ -343,7 +357,7 @@ async def _diary_dedup_loop():
 
 async def _proactive_loop():
     """后台定时检查，触发 48 主动联系 owner 和朋友。"""
-    await asyncio.sleep(300)  # 启动后等 5 分钟再开始
+    await asyncio.sleep(30)  # 启动后等 5 分钟再开始
     logger.info(f"主动 loop 启动 | 间隔={plugin_config.proactive_check_sec}s 冷却={plugin_config.proactive_cooldown_sec}s")
 
     first_run = True
@@ -351,7 +365,10 @@ async def _proactive_loop():
         if first_run:
             first_run = False
         else:
-            await asyncio.sleep(plugin_config.proactive_check_sec)
+            # 加随机偏移，避免固定周期被感知（±30% 抖动）
+            base = plugin_config.proactive_check_sec
+            jitter = base * random.uniform(-0.3, 0.3)
+            await asyncio.sleep(base + jitter)
         try:
             bot: Bot = nonebot.get_bot()
         except ValueError:
@@ -489,19 +506,14 @@ def _push_private(user_id: str, role: str, content: str, ts: float = 0):
     if not content.strip():
         return
     now = ts or time.time()
-    # 用户消息且间隔超过阈值，插入时间标记
+    # 用户消息且间隔超过阈值，把时间标记嵌入消息（不插假回复，避免 LLM 引用）
     if role == "user":
         last = _private_last_time.get(user_id, 0)
         gap = now - last if last else 0
         if gap >= TIME_GAP_THRESHOLD:
             dt_now = datetime.datetime.fromtimestamp(now)
             time_str = dt_now.strftime("%-m月%-d日 %H:%M")
-            _private_histories[user_id].append(
-                {"role": "user", "content": f"[{time_str}]"}
-            )
-            _private_histories[user_id].append(
-                {"role": "assistant", "content": "（继续对话）"}
-            )
+            content = f"[{time_str}] {content}"
     _private_last_time[user_id] = now
     _private_histories[user_id].append({"role": role, "content": content})
     if len(_private_histories[user_id]) > MAX_PRIVATE_HISTORY:
@@ -530,10 +542,31 @@ async def _send(bot: Bot, is_group: bool, group_id: str | None, user_id: str, te
 
 
 async def _typing_delay(text: str):
-    delay = max(2.0, len(text) * random.uniform(0.3, 0.6))
-    if random.random() < 0.2:
-        delay += random.uniform(1.5, 4.0)
-    await asyncio.sleep(delay)
+    """模拟打字延迟：短消息快回，长消息慢回，忙的时候更慢。"""
+    length = len(text)
+    w = get_willingness()
+
+    if length <= 5:
+        # 短消息（"嗯"、"行"、"哦"）：几乎秒回
+        base = random.uniform(0.3, 1.2)
+    elif length <= 20:
+        # 中等消息
+        base = random.uniform(1.0, 3.0)
+    else:
+        # 长消息
+        base = random.uniform(2.0, 5.0)
+
+    # 意愿度低 → 回得更慢（忙/困）
+    if w < 0.3:
+        base *= random.uniform(1.5, 2.5)
+    elif w < 0.5:
+        base *= random.uniform(1.1, 1.5)
+
+    # 偶尔停顿（"想了一下"）
+    if random.random() < 0.1:
+        base += random.uniform(2.0, 5.0)
+
+    await asyncio.sleep(base)
 
 
 async def _update_user_summary(user_id: str, user_name: str):
@@ -902,14 +935,13 @@ async def _flush_eval(user_id: str):
         asyncio.create_task(_write_story_entry(user_name, rounds_info, story_resp, ev.importance))
 
 
-async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool, search_query: str = ""):
+async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str, user_name: str, text: str, is_owner: bool, search_query: str = "", skip_push: bool = False):
     """调用 LLM 并发送回复。search_query 是 burst 期间所有消息的拼合，用于记忆/日记检索；text 是最后一条，用于上下文和发送。"""
     if not search_query:
         search_query = text
-    allowed, reject_msg = guard.check_rate(user_id, is_owner=is_owner)
+    allowed = guard.check_rate(user_id, is_owner=is_owner)
     if not allowed:
-        logger.warning(f"[{_tid()}] 速率限制 | user={user_id} msg={reject_msg}")
-        await _send(bot, is_group, group_id, user_id, reject_msg)
+        logger.warning(f"[{_tid()}] 速率限制 | user={user_id} 静默丢弃")
         return
 
     cached = guard.get_cached(user_id, text)
@@ -1019,7 +1051,8 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     if is_group:
         messages = build_group_turns(context=list(_group_context[group_id]), bot_name=plugin_config.bot_name)
     else:
-        _push_private(user_id, "user", text)
+        if not skip_push:
+            _push_private(user_id, "user", text)
         messages = list(_private_histories[user_id])
 
     logger.info(f"[{_tid()}] LLM → | user={user_id} msgs={len(messages)} group={is_group}")
@@ -1030,9 +1063,9 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     except Exception as e:
         elapsed = time.time() - t0
         logger.error(f"[{_tid()}] LLM ✗ | user={user_id} time={elapsed:.1f}s error={e}")
-        # 私聊历史里已经 push 了 user 消息，补一条失败标记保持配对
+        # 私聊历史里已经 push 了 user 消息，补一条保持配对
         if not is_group:
-            _push_private(user_id, "assistant", "(连接失败，没回上)")
+            _push_private(user_id, "assistant", "……")
         return
 
     logger.info(f"[{_tid()}] LLM ← | user={user_id} len={len(response)} time={elapsed:.1f}s")
@@ -1041,20 +1074,19 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     if not response.strip():
         logger.warning(f"[{_tid()}] 空响应 | user={user_id}，视为不回复")
         if not is_group:
-            _push_private(user_id, "assistant", "(已读不回)")
+            _push_private(user_id, "assistant", "……")
         return
 
     # 48 可以选择不回复
     if "[不回复]" in response:
         logger.info(f"[{_tid()}] 48 选择不回复 | user={user_id}")
         if not is_group:
-            _push_private(user_id, "assistant", "(已读不回)")
+            _push_private(user_id, "assistant", "……")
         return
 
     if is_group:
         _push_group(group_id, plugin_config.bot_name, response)
         _group_last_reply_time[group_id] = time.time()
-        _group_attention[group_id] = min(_group_attention[group_id] + ATTENTION_REPLY_BOOST, 1.0)
     else:
         _push_private(user_id, "assistant", response)
 
@@ -1074,9 +1106,15 @@ async def _do_reply(bot: Bot, is_group: bool, group_id: str | None, user_id: str
     if not lines:
         return
 
-    for line in lines[:-1]:
+    # 第一条消息也需要"打字"时间：LLM 生成太快时补一点延迟
+    min_first = 0.8 if len(lines[0]) <= 5 else 1.5
+    if elapsed < min_first:
+        await asyncio.sleep(min_first - elapsed)
+
+    for i, line in enumerate(lines[:-1]):
         await _send(bot, is_group, group_id, user_id, line)
-        await _typing_delay(line)
+        # 延迟按下一条消息的长度算（人是在"打下一条"的时候停顿）
+        await _typing_delay(lines[i + 1])
 
     await _send(bot, is_group, group_id, user_id, lines[-1])
     logger.info(f"[{_tid()}] 发送完成 | user={user_id} lines={len(lines)}")
@@ -1128,6 +1166,12 @@ async def handle(bot: Bot, event: MessageEvent):
         if user_id in _pending_followups:
             logger.debug(f"跟进取消 | user={sender_name} 对方已主动发消息")
             del _pending_followups[user_id]
+
+        # 取消延迟回复（新消息来了，旧的延迟没意义了，旧消息已在历史里）
+        if user_id in _delayed_reply_tasks:
+            _delayed_reply_tasks[user_id].cancel()
+            del _delayed_reply_tasks[user_id]
+            logger.debug(f"延迟回复取消 | user={sender_name} 对方又发了新消息")
     elif is_group:
         group_id = str(event.group_id)
 
@@ -1139,21 +1183,23 @@ async def handle(bot: Bot, event: MessageEvent):
         _group_msg_times[group_id].append(time.time())
 
         is_at = event.is_tome()
-        att = _update_attention(group_id, event, bot.self_id)
+        att = _calc_attention(group_id, event, bot.self_id)
 
         if not is_at:
             att *= _density_multiplier(group_id)
 
-        if not _should_reply_group(att):
+        if not _should_reply_group(att, is_at):
             logger.debug(f"群聊跳过 | {sender_name}@{group_id} att={att:.2f}")
             return
 
-        # 回复冷却：说完话静默一段时间，被@除外
+        # 回复冷却：概率衰减，刚说完话不太可能马上接话
         if not is_at:
             elapsed = time.time() - _group_last_reply_time.get(group_id, 0)
             if elapsed < REPLY_COOLDOWN_SEC:
-                logger.debug(f"回复冷却 | {group_id} 剩余{REPLY_COOLDOWN_SEC - elapsed:.0f}s")
-                return
+                cooldown_pass = elapsed / REPLY_COOLDOWN_SEC  # 0→1 渐增
+                if random.random() > cooldown_pass:
+                    logger.debug(f"回复冷却 | {group_id} elapsed={elapsed:.0f}s pass={cooldown_pass:.2f}")
+                    return
 
         logger.info(f"群聊回复 | {sender_name}@{group_id} att={att:.2f}")
     else:
@@ -1173,7 +1219,13 @@ async def handle(bot: Bot, event: MessageEvent):
     # 积累 burst 期间所有消息，防抖触发时拼合为 search_query，让记忆/日记检索覆盖整个 burst
     _burst_texts[key].append(text)
 
-    delay = BURST_COOLDOWN_SEC if key in _burst_active else DEBOUNCE_SEC
+    # 防抖时间浮动：闲的时候反应快，忙的时候慢
+    w = get_willingness()
+    w_factor = 1.3 - 0.6 * min(w, 1.0)  # w=0→1.3x, w=1→0.7x
+    if key in _burst_active:
+        delay = BURST_COOLDOWN_BASE * random.uniform(0.7, 1.3) * w_factor
+    else:
+        delay = DEBOUNCE_BASE * random.uniform(0.7, 1.3) * w_factor
     logger.info(f"防抖等待 | {key} delay={delay:.1f}s")
 
     async def debounced():
@@ -1184,6 +1236,30 @@ async def handle(bot: Bot, event: MessageEvent):
             # 取出并清空缓冲区（task 被取消时不会走到这里，缓冲继续积累）
             search_query = " ".join(_burst_texts.pop(key, [text]))
             logger.info(f"[{_tid()}] 防抖触发 | {key} → 调用 LLM query={search_query!r}")
+
+            # 私聊：可能延迟回复（"看到了但等会再回"）
+            if not is_group:
+                delay_sec = _should_delay_reply(user_id, text, is_owner)
+                if delay_sec is not None:
+                    # 先把消息推入历史（LLM 下次能看到），再延迟生成回复
+                    _push_private(user_id, "user", text)
+
+                    async def _delayed_coro():
+                        try:
+                            await asyncio.sleep(delay_sec)
+                        except asyncio.CancelledError:
+                            return
+                        _trace_ctx.set(_new_tid())
+                        logger.info(f"[{_tid()}] 延迟回复触发 | {sender_name} delay={delay_sec:.0f}s")
+                        _delayed_reply_tasks.pop(user_id, None)
+                        await _do_reply(bot, False, None, user_id, sender_name, text, is_owner,
+                                        search_query=search_query, skip_push=True)
+
+                    task = asyncio.create_task(_delayed_coro())
+                    _delayed_reply_tasks[user_id] = task
+                    logger.info(f"[{_tid()}] 延迟回复 | {sender_name} delay={delay_sec:.0f}s")
+                    return
+
             await _do_reply(bot, is_group, group_id, user_id, sender_name, text, is_owner, search_query=search_query)
         finally:
             # 只有自己还是当前任务时才清理，避免取消后覆盖后继任务的槽位

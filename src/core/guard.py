@@ -42,13 +42,14 @@ class Guard:
             self._api_calls_today = 0
             self._today = today
 
-    def check_rate(self, user_id: str, is_owner: bool = False) -> tuple[bool, str]:
+    def check_rate(self, user_id: str, is_owner: bool = False) -> bool:
+        """检查速率限制。超限返回 False（静默丢弃，不回复）。"""
         now = time.time()
         self._ensure_date()
 
         if self._daily_count >= self._daily_max:
             logger.warning(f"日预算耗尽 ({self._daily_count}/{self._daily_max})")
-            return False, "今天说太多了，歇了。"
+            return False
 
         # owner 放宽 3 倍速率，其他人正常
         rpm = self._rpm * 3 if is_owner else self._rpm
@@ -57,11 +58,9 @@ class Guard:
         self._user_hits[user_id] = hits
 
         if len(hits) >= rpm:
-            if is_owner:
-                return False, "你慢点，我处理不过来。"
-            return False, "你说得太快了，歇会。"
+            return False
 
-        return True, ""
+        return True
 
     # ── 缓存 ──
 
