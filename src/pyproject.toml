@@ -4,14 +4,21 @@ version = "0.1.0"
 description = "AptS:1548 - 不是机器人，是人"
 requires-python = ">=3.10"
 dependencies = [
+    "surrealdb>=1.0.8",
+    "qdrant-client>=1.17.0",
+    "httpx>=0.28.1",
+    "sentence-transformers>=5.2.3",
+    "anthropic>=0.84.0",
     "nonebot2[fastapi]>=2.4.4",
-    "nonebot-adapter-onebot>=2.4.0",
-    "anthropic>=0.40.0",
-    "qdrant-client>=1.7.0",
-    "sentence-transformers>=3.0.0",
-    "surrealdb>=1.0.0",
-    "httpx>=0.27.0",
+    "nonebot-adapter-onebot>=2.4.6",
 ]
+
+[tool.uv]
+index-strategy = "unsafe-best-match"
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 
 [tool.nonebot]
 plugin_dirs = ["plugins"]
