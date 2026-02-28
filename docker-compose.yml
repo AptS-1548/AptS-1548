@@ -1,4 +1,17 @@
 services:
+  bot:
+    build: .
+    env_file: src/.env
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - SURREALDB_URL=ws://surrealdb:8000
+    volumes:
+      - ./data/bot:/app/data
+    depends_on:
+      - qdrant
+      - surrealdb
+    restart: unless-stopped
+
   qdrant:
     image: qdrant/qdrant:latest
     ports:

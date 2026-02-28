@@ -1,0 +1,9 @@
+src/.venv
+src/.claude
+src/data/
+src/.env
+src/scripts/
+src/**/__pycache__
+**/*.pyc
+.git
+**/*.zip
