@@ -12,7 +12,8 @@ RUN uv sync --frozen --no-install-project --no-dev
 # ── Stage 2: 预下载 embedding 模型 ──
 FROM deps AS model
 
-RUN .venv/bin/python -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('BAAI/bge-small-zh-v1.5')"
+ENV FASTEMBED_CACHE_PATH=/app/models
+RUN .venv/bin/python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-zh-v1.5', cache_dir='/app/models')"
 
 # ── Stage 3: 运行镜像 ──
 FROM python:3.11-slim
@@ -24,9 +25,10 @@ COPY src/ .
 COPY --from=deps /app/.venv /app/.venv
 
 # 预下载的模型缓存
-COPY --from=model /root/.cache/huggingface /root/.cache/huggingface
+COPY --from=model /app/models /app/models
 
 ENV PATH="/app/.venv/bin:$PATH"
+ENV FASTEMBED_CACHE_PATH=/app/models
 ENV PYTHONUNBUFFERED=1
 
 RUN mkdir -p /app/data

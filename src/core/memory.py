@@ -26,7 +26,7 @@ from qdrant_client.models import (
     ScalarType,
     VectorParams,
 )
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 COLLECTION = "apts1548"
 VECTOR_DIM = 512  # bge-small-zh-v1.5 输出维度
@@ -49,7 +49,7 @@ class MemoryEntry:
 class Memory:
     def __init__(self, qdrant_url: str = "http://localhost:6333"):
         self._client = QdrantClient(url=qdrant_url)
-        self._model: SentenceTransformer | None = None
+        self._model: TextEmbedding | None = None
         self._embed_cache: dict[str, list[float]] = {}  # Fix 4: 嵌入缓存
         self._ensure_collection()
         self._load_model()  # 启动时预加载，避免首次对话延迟
@@ -106,17 +106,17 @@ class Memory:
 
     # ── Embedding ──
 
-    def _load_model(self) -> SentenceTransformer:
+    def _load_model(self) -> TextEmbedding:
         if self._model is None:
             logger.info("记忆 | 加载 Embedding 模型 bge-small-zh-v1.5 ...")
-            self._model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+            self._model = TextEmbedding(model_name="BAAI/bge-small-zh-v1.5")
             logger.info("记忆 | 模型加载完成")
         return self._model
 
     def _embed(self, text: str) -> list[float]:
         """Fix 4: 带 LRU cache 的单条向量化。"""
         if text not in self._embed_cache:
-            result = self._load_model().encode(text, normalize_embeddings=True).tolist()
+            result = list(self._load_model().embed([text]))[0].tolist()
             if len(self._embed_cache) >= EMBED_CACHE_SIZE:
                 # 淘汰最旧的 25%
                 for k in list(self._embed_cache.keys())[:EMBED_CACHE_SIZE // 4]:
@@ -126,7 +126,7 @@ class Memory:
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Fix 5: 批量向量化，比多次单独 encode 更高效。"""
-        return self._load_model().encode(texts, normalize_embeddings=True).tolist()
+        return [v.tolist() for v in self._load_model().embed(texts)]
 
     # ── 存储 ──
 
