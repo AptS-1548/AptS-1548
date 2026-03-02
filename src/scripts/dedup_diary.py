@@ -29,7 +29,6 @@ from qdrant_client.models import (
     OrderBy,
     PointIdsList,
 )
-from sentence_transformers import SentenceTransformer
 
 COLLECTION = "apts1548"
 
@@ -135,9 +134,6 @@ def main():
 
     print(f"连接 Qdrant: {args.qdrant_url}")
     client = QdrantClient(url=args.qdrant_url)
-
-    print("加载 Embedding 模型 ...")
-    model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
 
     print("拉取所有日记 ...")
     points = fetch_all_diaries(client)

@@ -29,7 +29,7 @@ from qdrant_client.models import (
     PointIdsList,
     PointStruct,
 )
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 
 COLLECTION = "apts1548"
 TARGET_POV = "1548"
@@ -222,7 +222,7 @@ def delete_existing_stories(client: QdrantClient) -> int:
 
 def import_chunks(
     client: QdrantClient,
-    model: SentenceTransformer,
+    model: TextEmbedding,
     chunks: list[dict],
 ) -> int:
     """向量化并写入 Qdrant。返回写入数量。"""
@@ -230,7 +230,7 @@ def import_chunks(
         return 0
 
     texts = [c["text"] for c in chunks]
-    vectors = model.encode(texts, normalize_embeddings=True)
+    vectors = list(model.embed(texts))
 
     points = []
     now = time.time()
@@ -316,7 +316,7 @@ def main():
 
     # 连接
     print("加载 embedding 模型...")
-    model = SentenceTransformer("BAAI/bge-small-zh-v1.5")
+    model = TextEmbedding(model_name="BAAI/bge-small-zh-v1.5")
 
     print(f"连接 Qdrant: {args.qdrant_url}")
     client = QdrantClient(url=args.qdrant_url)
