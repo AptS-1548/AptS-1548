@@ -12,6 +12,7 @@ RUN uv sync --frozen --no-install-project --no-dev
 # ── Stage 2: 预下载 embedding 模型 ──
 FROM deps AS model
 
+ENV HF_ENDPOINT=https://hf-mirror.com
 ENV FASTEMBED_CACHE_PATH=/app/models
 RUN .venv/bin/python -c "from fastembed import TextEmbedding; TextEmbedding(model_name='BAAI/bge-small-zh-v1.5', cache_dir='/app/models')"
 
